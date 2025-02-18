@@ -7,16 +7,17 @@ import { timeoutPromise } from "@scrypted/common/src/promise-utils";
 import sdk, { AudioSensor, FFmpegInput, MotionSensor, ScryptedDevice, ScryptedInterface, ScryptedMimeTypes, VideoCamera } from '@scrypted/sdk';
 import child_process from "child_process";
 import fs from 'fs';
-import mkdirp from 'mkdirp';
+import { mkdirp } from 'mkdirp';
 import net from 'net';
+import path from 'path';
 import { Duplex, Readable, Writable } from 'stream';
 import { } from '../../common';
-import { AudioRecordingCodecType, AudioRecordingSamplerateValues, CameraRecordingConfiguration, DataStreamConnection } from '../../hap';
+import { AudioRecordingCodecType, CameraRecordingConfiguration, RecordingPacket } from '../../hap';
 import type { HomeKitPlugin } from "../../main";
-import { getCameraRecordingFiles, HksvVideoClip, VIDEO_CLIPS_NATIVE_ID } from './camera-recording-files';
-import { checkCompatibleCodec, FORCE_OPUS, transcodingDebugModeWarning } from './camera-utils';
+import { getDebugMode } from "./camera-debug-mode-storage";
+import { HksvVideoClip, VIDEO_CLIPS_NATIVE_ID, getCameraRecordingFiles } from './camera-recording-files';
+import { FORCE_OPUS, checkCompatibleCodec, transcodingDebugModeWarning } from './camera-utils';
 import { NAL_TYPE_DELIMITER, NAL_TYPE_FU_A, NAL_TYPE_IDR, NAL_TYPE_PPS, NAL_TYPE_SEI, NAL_TYPE_SPS, NAL_TYPE_STAP_A } from "./h264-packetizer";
-import path from 'path';
 
 const { log, mediaManager, deviceManager } = sdk;
 
@@ -32,6 +33,14 @@ const allowedNaluTypes = [
     NAL_TYPE_DELIMITER,
 ];
 
+const AudioRecordingSamplerateValues = {
+    0: 8,
+    1: 16,
+    2: 24,
+    3: 32,
+    4: 44.1,
+    5: 48,
+};
 
 async function checkMp4StartsWithKeyFrame(console: Console, mp4: Buffer) {
     const cp = child_process.spawn(await mediaManager.getFFmpegPath(), [
@@ -58,12 +67,29 @@ async function checkMp4StartsWithKeyFrame(console: Console, mp4: Buffer) {
         await timeoutPromise(1000, new Promise(resolve => cp.on('exit', resolve)));
         const h264 = Buffer.concat(buffers);
         let offset = 0;
+        let countedZeroes = 0;
         while (offset < h264.length - 6) {
-            if (h264.readInt32BE(offset) !== 1) {
+            const byte = h264[offset];
+            if (byte === 0) {
+                countedZeroes = Math.min(4, countedZeroes + 1);
                 offset++;
                 continue;
             }
-            offset += 4;
+
+            if (countedZeroes < 2) {
+                countedZeroes = 0;
+                offset++
+                continue;
+            }
+
+            countedZeroes = 0;
+            if (byte !== 1) {
+                offset++;
+                continue;
+            }
+
+            offset++;
+
             let naluType = h264.readUInt8(offset) & 0x1f;
             if (naluType === NAL_TYPE_FU_A) {
                 offset++;
@@ -89,18 +115,19 @@ async function checkMp4StartsWithKeyFrame(console: Console, mp4: Buffer) {
     }
 }
 
-export async function* handleFragmentsRequests(connection: DataStreamConnection, device: ScryptedDevice & VideoCamera & MotionSensor & AudioSensor,
-    configuration: CameraRecordingConfiguration, console: Console, homekitPlugin: HomeKitPlugin): AsyncGenerator<Buffer, void, unknown> {
+export async function* handleFragmentsRequests(streamId: number, device: ScryptedDevice & VideoCamera & MotionSensor & AudioSensor,
+    configuration: CameraRecordingConfiguration, console: Console, homekitPlugin: HomeKitPlugin, isOpen: () => boolean): AsyncGenerator<RecordingPacket> {
 
-    homekitPlugin.storageSettings.values.lastKnownHomeHub = connection.remoteAddress;
+    // homekitPlugin.storageSettings.values.lastKnownHomeHub = connection.remoteAddress;
 
-    console.log(device.name, 'recording session starting', connection.remoteAddress, configuration);
+    // console.log(device.name, 'recording session starting', connection.remoteAddress, configuration);
 
     const storage = deviceManager.getMixinStorage(device.id, undefined);
-    const saveRecordings = device.mixins.includes(homekitPlugin.videoClipsId);
+    const debugMode = getDebugMode(storage);
+    const saveRecordings = debugMode.recording;
 
     // request more than needed, and determine what to do with the fragments after receiving them.
-    const prebuffer = configuration.mediaContainerConfiguration.prebufferLength * 2.5;
+    const prebuffer = configuration.prebufferLength * 2.5;
 
     const media = await device.getVideoStream({
         destination: 'remote-recorder',
@@ -122,15 +149,14 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
     const audioCodec = ffmpegInput.mediaStreamOptions?.audio?.codec;
     const videoCodec = ffmpegInput.mediaStreamOptions?.video?.codec;
     const isDefinitelyNotAAC = !audioCodec || audioCodec.toLowerCase().indexOf('aac') === -1;
-    const transcodingDebugMode = storage.getItem('transcodingDebugMode') === 'true';
     const transcodeRecording = !!ffmpegInput.h264EncoderArguments?.length || !!ffmpegInput.h264FilterArguments?.length;
-    const needsFFmpeg = transcodingDebugMode
+    const needsFFmpeg = debugMode.video || debugMode.video
         || !ffmpegInput.url.startsWith('tcp://')
         || transcodeRecording
         || ffmpegInput.container !== 'mp4'
         || noAudio;
 
-    if (transcodingDebugMode)
+    if (debugMode.video || debugMode.video)
         transcodingDebugModeWarning();
 
     let session: FFmpegFragmentedMP4Session & { socket?: Duplex };
@@ -152,7 +178,7 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
                 width: configuration.videoCodec.resolution[0],
                 height: configuration.videoCodec.resolution[1],
                 fps: configuration.videoCodec.resolution[2],
-                max_bit_rate: configuration.videoCodec.bitrate,
+                max_bit_rate: configuration.videoCodec.parameters.bitRate,
             }
         }
 
@@ -168,8 +194,8 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
         }
 
         let audioArgs: string[];
-        if (transcodeRecording || isDefinitelyNotAAC || transcodingDebugMode) {
-            if (!(transcodeRecording || transcodingDebugMode))
+        if (!noAudio && (transcodeRecording || isDefinitelyNotAAC || debugMode.audio)) {
+            if (!(transcodeRecording || debugMode.audio))
                 console.warn('Recording audio is not explicitly AAC, forcing transcoding. Setting audio output to AAC is recommended.', audioCodec);
 
             let aacLowEncoder = 'aac';
@@ -199,8 +225,8 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
         }
 
         const videoArgs = ffmpegInput.h264FilterArguments?.slice() || [];
-        if (transcodingDebugMode || transcodeRecording) {
-            if (transcodingDebugMode || !ffmpegInput.h264EncoderArguments) {
+        if (debugMode.video || transcodeRecording) {
+            if (debugMode.video || !ffmpegInput.h264EncoderArguments) {
                 videoArgs.push(...getDebugModeH264EncoderArgs());
             }
             else {
@@ -209,7 +235,7 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
             const videoRecordingFilter = `scale=w='min(${configuration.videoCodec.resolution[0]},iw)':h=-2`;
             addVideoFilterArguments(videoArgs, videoRecordingFilter);
             videoArgs.push(
-                '-b:v', `${configuration.videoCodec.bitrate}k`,
+                '-b:v', `${configuration.videoCodec.parameters.bitRate}k`,
                 "-bufsize", (2 * request.video.max_bit_rate).toString() + "k",
                 "-maxrate", request.video.max_bit_rate.toString() + "k",
                 // used to use this but switched to group of picture (gop) instead.
@@ -266,17 +292,18 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
         safeKillFFmpeg(cp);
     }
 
+    let isLast = false;
     console.log(`motion recording started`);
     const { socket, cp, generator } = session;
     const videoTimeout = setTimeout(() => {
         console.error('homekit secure video max duration reached');
-        cleanupPipes();
+        isLast = true;
+        setTimeout(cleanupPipes, 10000);
     }, maxVideoDuration);
 
     let pending: Buffer[] = [];
     try {
         let i = 0;
-        console.time('mp4 recording');
         // if ffmpeg is being used to parse a prebuffered stream that is NOT mp4 (despite our request),
         // it seems that ffmpeg may output a bad first fragment. it may be missing various codec informations or
         // it may start on a non keyframe. HAP requires every fragment start on a keyframe.
@@ -292,7 +319,11 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
         let needSkip = true;
         let ftyp: Buffer[];
         let moov: Buffer[];
+
         for await (const box of generator) {
+            if (!isOpen())
+                return;
+            
             const { header, type, data } = box;
             // console.log('motion fragment box', type);
 
@@ -304,7 +335,7 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
                 checkMp4 = false;
                 // pending will contain the moof
                 try {
-                    if (!await checkMp4StartsWithKeyFrame(console, Buffer.concat([...ftyp, ...moov, ...pending, header, data]))) {
+                    if (false && !await checkMp4StartsWithKeyFrame(console, Buffer.concat([...ftyp, ...moov, ...pending, header, data]))) {
                         needSkip = false;
                         pending = [];
                         continue;
@@ -324,21 +355,29 @@ export async function* handleFragmentsRequests(connection: DataStreamConnection,
                     needSkip = false;
                     continue;
                 }
+                if (!isOpen())
+                    return;
                 const fragment = Buffer.concat(pending);
                 saveFragment(i, fragment);
                 pending = [];
                 console.log(`motion fragment #${++i} sent. size:`, fragment.length);
-                yield fragment;
+                const wasLast = isLast;
+                const recordingPacket: RecordingPacket = {
+                    data: fragment,
+                    isLast,
+                }
+                yield recordingPacket;
+                if (wasLast)
+                    break;
             }
         }
-        console.log(`motion recording finished`);
     }
     catch (e) {
-        console.log(`motion recording completed ${e}`);
+        console.log(`motion recording error ${e}`);
     }
     finally {
+        console.log(`motion recording finished`);
         clearTimeout(videoTimeout);
-        console.timeEnd('mp4 recording');
         cleanupPipes();
         recordingFile?.end();
         recordingFile?.destroy();

@@ -1,13 +1,25 @@
-import { ffmpegLogInitialOutput } from '@scrypted/common/src/media-helpers';
-import { readLength } from '@scrypted/common/src/read-stream';
-import sdk, { Camera, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, VideoStreamOptions } from "@scrypted/sdk";
-import child_process, { ChildProcess } from 'child_process';
-import { PassThrough, Readable } from "stream";
-import { sleep } from "../../../common/src/sleep";
-import { OnvifIntercom } from "../../onvif/src/onvif-intercom";
-import { RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
-import { getChannel, HikVisionCameraAPI, HikVisionCameraEvent, hikvisionHttpsAgent } from "./hikvision-camera-api";
+import { automaticallyConfigureSettings, checkPluginNeedsAutoConfigure } from "@scrypted/common/src/autoconfigure-codecs";
+import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, FFmpegInput, Intercom, MediaObject, MediaStreamOptions, ObjectDetectionResult, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, Reboot, RequestPictureOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, ScryptedNativeId, Setting, VideoCameraConfiguration, VideoTextOverlay, VideoTextOverlays } from "@scrypted/sdk";
+import crypto from 'crypto';
+import { PassThrough } from "stream";
 import xml2js from 'xml2js';
+import { RtpPacket } from '../../../external/werift/packages/rtp/src/rtp/rtp';
+import { OnvifIntercom } from "../../onvif/src/onvif-intercom";
+import { createRtspMediaStreamOptions, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
+import { startRtpForwarderProcess } from '../../webrtc/src/rtp-forwarders';
+import { HikvisionAPI } from "./hikvision-api-channels";
+import { autoconfigureSettings, hikvisionAutoConfigureSettings } from "./hikvision-autoconfigure";
+import { detectionMap, HikvisionCameraAPI, HikvisionCameraEvent } from "./hikvision-camera-api";
+import { HikvisionSupplementalLight } from "./supplemental-light";
+import { HikvisionAlarmSwitch } from "./alarm-switch";
+
+const rtspChannelSetting: Setting = {
+    subgroup: 'Advanced',
+    key: 'rtspChannel',
+    title: 'Channel Number',
+    description: "Optional: The channel number to use for snapshots. E.g., 101, 201, etc. The camera portion, e.g., 1, 2, etc, will be used to construct the RTSP stream.",
+    placeholder: '101',
+};
 
 const { mediaManager } = sdk;
 
@@ -17,95 +29,279 @@ function channelToCameraNumber(channel: string) {
     return channel.substring(0, channel.length - 2);
 }
 
-class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
+export class HikvisionCamera extends RtspSmartCamera implements Camera, Intercom, Reboot, ObjectDetector, VideoCameraConfiguration, VideoTextOverlays {
     detectedChannels: Promise<Map<string, MediaStreamOptions>>;
-    client: HikVisionCameraAPI;
     onvifIntercom = new OnvifIntercom(this);
-    cp: ChildProcess;
+    activeIntercom: Awaited<ReturnType<typeof startRtpForwarderProcess>>;
+    hasSmartDetection: boolean;
+    floodlight: HikvisionSupplementalLight;
+    alarm: HikvisionAlarmSwitch;
+
+    client: HikvisionAPI;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
 
-        this.updateManagementUrl();
+        this.hasSmartDetection = this.storage.getItem('hasSmartDetection') === 'true';
+        this.updateDevice();
+        this.updateDeviceInfo();
+        (async () => {
+            await this.reportDevices();
+        })();
     }
 
-    updateManagementUrl() {
+    async getVideoTextOverlays(): Promise<Record<string, VideoTextOverlay>> {
+        const client = this.getClient();
+        const overlays = await client.getOverlay();
+        const ret: Record<string, VideoTextOverlay> = {};
+
+        for (const to of overlays.json.VideoOverlay.TextOverlayList?.[0]?.TextOverlay) {
+            ret[to.id[0]] = {
+                text: to.displayText[0],
+            }
+        }
+        return ret;
+    }
+
+    async setVideoTextOverlay(id: string, value: VideoTextOverlay): Promise<void> {
+        const client = this.getClient();
+        const overlays = await client.getOverlay();
+        // find the overlay by id
+        const overlay = overlays.json.VideoOverlay.TextOverlayList?.[0]?.TextOverlay.find(o => o.id[0] === id);
+        overlay.enabled[0] = value.text ? 'true' : 'false';
+        if (typeof value.text === 'string')
+            overlay.displayText = [value.text];
+        client.updateOverlayText(id, {
+            TextOverlay: overlay,
+        });
+    }
+
+    async hasFloodlight(): Promise<boolean> {
+        try {
+            const client = this.getClient();
+            const { json } = await client.getSupplementLight();
+            return !!(json && json.SupplementLight);
+        }
+        catch (e) {
+            if ((e.statusCode && e.statusCode === 403) ||
+                (typeof e.message === 'string' && e.message.includes('403'))) {
+                return false;
+            }
+            this.console.error('Error checking supplemental light', e);
+            return false;
+        }
+    }
+
+    async hasAlarm(): Promise<boolean> {
+        try {
+            const client = this.getClient();
+            const config = await client.getAlarmTriggerConfig();
+            return config.audioAlarmSupported || config.whiteLightAlarmSupported || config.ioSupported;
+        }
+        catch (e) {
+            if ((e.statusCode && e.statusCode === 403) ||
+                (typeof e.message === 'string' && e.message.includes('403'))) {
+                return false;
+            }
+            this.console.error('Error checking alarm', e);
+            return false;
+        }
+    }
+
+    async reboot() {
+        const client = this.getClient();
+        await client.reboot();
+    }
+
+    async setVideoStreamOptions(options: MediaStreamOptions) {
+        let vsos = await this.getVideoStreamOptions();
+        const index = vsos.findIndex(vso => vso.id === options.id);
+        const client = this.getClient();
+        return client.configureCodecs(this.getCameraNumber() || '1', (index + 1).toString().padStart(2, '0'), options)
+    }
+
+    async updateDeviceInfo() {
         const ip = this.storage.getItem('ip');
         if (!ip)
             return;
-        const info = this.info || {};
         const managementUrl = `http://${ip}`;
-        if (info.managementUrl !== managementUrl) {
-            info.managementUrl = managementUrl;
-            this.info = info;
+        const info: DeviceInformation = {
+            ...this.info,
+            managementUrl,
+            ip,
+            manufacturer: 'Hikvision',
+        };
+        const client = this.getClient();
+        const deviceInfo = await client.getDeviceInfo().catch(() => { });
+        if (deviceInfo) {
+            info.model = deviceInfo.deviceModel;
+            info.mac = deviceInfo.macAddress;
+            info.firmware = deviceInfo.firmwareVersion;
+            info.serialNumber = deviceInfo.serialNumber;
         }
+        this.info = info;
     }
 
     async listenEvents() {
         let motionTimeout: NodeJS.Timeout;
-        const api = (this.provider as HikVisionProvider).createSharedClient(this.getHttpAddress(), this.getUsername(), this.getPassword());
+        const api = (this.provider as HikvisionProvider).createSharedClient(this.getHttpAddress(), this.getUsername(), this.getPassword());
         const events = await api.listenEvents();
 
         let ignoreCameraNumber: boolean;
 
-        let motionPingsNeeded = parseInt(this.storage.getItem('motionPings')) || 1;
-        const motionTimeoutDuration = (parseInt(this.storage.getItem('motionTimeout') )|| 10) * 1000;
-        let motionPings = 0;
-        events.on('event', async (event: HikVisionCameraEvent, cameraNumber: string, inactive: boolean) => {
-            if (event === HikVisionCameraEvent.MotionDetected
-                || event === HikVisionCameraEvent.LineDetection
-                || event === HikVisionCameraEvent.FieldDetection) {
+        const motionTimeoutDuration = 20000;
 
-                // check if the camera+channel field is in use, and filter events.
-                if (this.getRtspChannel()) {
-                    // it is possible to set it up to use a camera number
-                    // on an nvr IP (which gives RTSP urls through the NVR), but then use a http port
-                    // that gives a filtered event stream from only that camera.
-                    // this this case, the camera numbers will not
-                    // match as they will be always be "1".
-                    // to detect that a camera specific endpoint is being used
-                    // can look at the channel ids, and see if that camera number is found.
-                    // this is different from the use case where the NVR or camera
-                    // is using a port other than 80 (the default).
-                    // could add a setting to have the user explicitly denote nvr usage
-                    // but that is error prone.
-                    const userCameraNumber = this.getCameraNumber();
-                    if (ignoreCameraNumber === undefined && this.detectedChannels) {
-                        const channelIds = (await this.detectedChannels).keys();
-                        ignoreCameraNumber = true;
-                        for (const id of channelIds) {
-                            if (channelToCameraNumber(id) === userCameraNumber) {
-                                ignoreCameraNumber = false;
-                                break;
-                            }
+        // check if the camera+channel field is in use, and filter events.
+        const checkCameraNumber = async (cameraNumber: string) => {
+            // check if the camera+channel field is in use, and filter events.
+            if (this.getRtspChannel()) {
+                // it is possible to set it up to use a camera number
+                // on an nvr IP (which gives RTSP urls through the NVR), but then use a http port
+                // that gives a filtered event stream from only that camera.
+                // this this case, the camera numbers will not
+                // match as they will be always be "1".
+                // to detect that a camera specific endpoint is being used
+                // can look at the channel ids, and see if that camera number is found.
+                // this is different from the use case where the NVR or camera
+                // is using a port other than 80 (the default).
+                // could add a setting to have the user explicitly denote nvr usage
+                // but that is error prone.
+                const userCameraNumber = this.getCameraNumber();
+                if (ignoreCameraNumber === undefined && this.detectedChannels) {
+                    const channelIds = (await this.detectedChannels).keys();
+                    ignoreCameraNumber = true;
+                    for (const id of channelIds) {
+                        if (channelToCameraNumber(id) === userCameraNumber) {
+                            ignoreCameraNumber = false;
+                            break;
                         }
                     }
-
-                    if (!ignoreCameraNumber && cameraNumber !== userCameraNumber) {
-                        // this.console.error(`### Skipping motion event ${cameraNumber} != ${this.getCameraNumber()}`);
-                        return;
-                    }
                 }
-                
-                motionPings++;
-                // this.console.log(this.name, 'motion pings', motionPings);
 
-                // this.console.error('### Detected motion, camera: ', cameraNumber);
-                this.motionDetected = motionPings >= motionPingsNeeded;
+                if (!ignoreCameraNumber && cameraNumber !== userCameraNumber) {
+                    // this.console.error(`### Skipping motion event ${cameraNumber} != ${this.getCameraNumber()}`);
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        events.on('event', async (event: HikvisionCameraEvent, cameraNumber: string, inactive: boolean) => {
+            if (event === HikvisionCameraEvent.MotionDetected
+                || event === HikvisionCameraEvent.LineDetection
+                || event === HikvisionCameraEvent.RegionEntrance
+                || event === HikvisionCameraEvent.RegionExit
+                || event === HikvisionCameraEvent.FieldDetection) {
+
+                if (!await checkCameraNumber(cameraNumber))
+                    return;
+
+                this.motionDetected = true;
                 clearTimeout(motionTimeout);
                 // motion seems to be on a 1 second pulse
                 motionTimeout = setTimeout(() => {
                     this.motionDetected = false;
-                    motionPings = 0;
                 }, motionTimeoutDuration);
             }
-        })
+        });
+
+        let inputDimensions: [number, number];
+
+        events.on('smart', async (data: string, image: Buffer) => {
+            if (!this.hasSmartDetection) {
+                this.hasSmartDetection = true;
+                this.storage.setItem('hasSmartDetection', 'true');
+                this.updateDevice();
+            }
+
+            const xml = await xml2js.parseStringPromise(data);
+
+
+            const [channelId] = xml.EventNotificationAlert.channelID || xml.EventNotificationAlert.dynChannelID;
+            if (!await checkCameraNumber(channelId)) {
+                this.console.warn('chann fail')
+                return;
+            }
+
+            const now = Date.now();
+            let detections: ObjectDetectionResult[] = xml.EventNotificationAlert?.DetectionRegionList?.map(region => {
+                const name = region?.DetectionRegionEntry?.[0]?.detectionTarget?.name;
+                if (!name)
+                    return;
+                return {
+                    score: 1,
+                    className: detectionMap[name] || name,
+                    // boundingBox: [
+                    //     parseInt(X),
+                    //     parseInt(Y),
+                    //     parseInt(width),
+                    //     parseInt(height),
+                    // ],
+                    // movement: {
+                    //     moving: true,
+                    //     firstSeen: now,
+                    //     lastSeen: now,
+                    // }
+                } as ObjectDetectionResult;
+            });
+
+            detections = detections?.filter(d => d);
+            if (!detections?.length)
+                return;
+
+            // if (inputDimensions === undefined && loadSharp()) {
+            //     try {
+            //         const { image: i, metadata } = await loadVipsMetadata(image);
+            //         i.destroy();
+            //         inputDimensions = [metadata.width, metadata.height];
+            //     }
+            //     catch (e) {
+            //         inputDimensions = null;
+            //     }
+            //     finally {
+            //     }
+            // }
+
+            let detectionId: string;
+            if (image) {
+                detectionId = crypto.randomBytes(4).toString('hex');
+                this.recentDetections.set(detectionId, image);
+                setTimeout(() => this.recentDetections.delete(detectionId), 10000);
+            }
+
+            const detected: ObjectsDetected = {
+                inputDimensions,
+                detectionId,
+                timestamp: now,
+                detections,
+            };
+
+            this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
+        });
 
         return events;
     }
 
-    createClient() {
-        return new HikVisionCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console);
+    recentDetections = new Map<string, Buffer>();
+
+    async getDetectionInput(detectionId: string, eventId?: any): Promise<MediaObject> {
+        const image = this.recentDetections.get(detectionId);
+        if (!image)
+            return;
+        return mediaManager.createMediaObject(image, 'image/jpeg');
+    }
+
+    async getObjectTypes(): Promise<ObjectDetectionTypes> {
+        return {
+            classes: [
+                ...Object.values(detectionMap),
+            ]
+        }
+    }
+
+    createClient(): HikvisionAPI {
+        return new HikvisionCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console);
     }
 
     getClient() {
@@ -114,9 +310,9 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
         return this.client;
     }
 
-    async takeSmartCameraPicture(): Promise<MediaObject> {
+    async takeSmartCameraPicture(options?: RequestPictureOptions): Promise<MediaObject> {
         const api = this.getClient();
-        return mediaManager.createMediaObject(await api.jpegSnapshot(this.getRtspChannel()), 'image/jpeg');
+        return mediaManager.createMediaObject(await api.jpegSnapshot(this.getRtspChannel(), options?.timeout), 'image/jpeg');
     }
 
     async getRtspUrlSettings(): Promise<Setting[]> {
@@ -124,7 +320,7 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
 
         ret.push(
             {
-                group: 'Advanced',
+                subgroup: 'Advanced',
                 key: 'rtspUrlParams',
                 title: 'RTSP URL Parameters Override',
                 description: "Optional: Override the RTSP URL parameters. E.g.: ?transportmode=unicast",
@@ -136,15 +332,14 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
     }
 
     async getUrlSettings(): Promise<Setting[]> {
+        const rtspSetting = {
+            ...rtspChannelSetting,
+            subgroup: 'Advanced',
+            value: this.storage.getItem('rtspChannel'),
+        };
+
         return [
-            {
-                group: 'Advanced',
-                key: 'rtspChannel',
-                title: 'Channel Number',
-                description: "Optional: The channel number to use for snapshots. E.g., 101, 201, etc. The camera portion, e.g., 1, 2, etc, will be used to construct the RTSP stream.",
-                placeholder: '101',
-                value: this.storage.getItem('rtspChannel'),
-            },
+            rtspSetting,
             ...await super.getUrlSettings(),
         ]
     }
@@ -188,47 +383,32 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
                 if (isOld) {
                     this.console.error('Old NVR. Defaulting to two camera configuration');
                     return defaultMap;
-                } else {
+                }
+
+                try {
+                    let channels: MediaStreamOptions[];
                     try {
-                        let xml: string;
-                        try {
-                            const response = await client.digestAuth.request({
-                                httpsAgent: hikvisionHttpsAgent,
-                                url: `http://${this.getHttpAddress()}/ISAPI/Streaming/channels`,
-                                responseType: 'text',
-                            });
-                            xml = response.data;
-                            this.storage.setItem('channels', xml);
-                        }
-                        catch (e) {
-                            xml = this.storage.getItem('channels');
-                            if (!xml)
-                                throw e;
-                        }
-                        const parsedXml = await xml2js.parseStringPromise(xml);
-
-                        const ret = new Map<string, MediaStreamOptions>();
-                        for (const streamingChannel of parsedXml.StreamingChannelList.StreamingChannel) {
-                            const [id] = streamingChannel.id;
-                            const width = parseInt(streamingChannel?.Video?.[0]?.videoResolutionWidth?.[0]) || undefined;
-                            const height = parseInt(streamingChannel?.Video?.[0]?.videoResolutionHeight?.[0]) || undefined;
-                            const vso: MediaStreamOptions = {
-                                id,
-                                video: {
-                                    width,
-                                    height,
-                                }
-                            }
-                            ret.set(id, vso);
-                        }
-
-                        return ret;
+                        channels = await client.getCodecs(camNumber);
+                        this.storage.setItem('channelsJSON', JSON.stringify(channels));
                     }
                     catch (e) {
-                        this.console.error('error retrieving channel ids', e);
-                        this.detectedChannels = undefined;
-                        return defaultMap;
+                        const raw = this.storage.getItem('channelsJSON');
+                        if (!raw)
+                            throw e;
+                        channels = JSON.parse(raw);
                     }
+                    const ret = new Map<string, MediaStreamOptions>();
+                    for (const streamingChannel of channels) {
+                        const channel = streamingChannel.id;
+                        ret.set(channel, streamingChannel);
+                    }
+
+                    return ret;
+                }
+                catch (e) {
+                    this.console.error('error retrieving channel ids', e);
+                    this.detectedChannels = undefined;
+                    return defaultMap;
                 }
             })();
         }
@@ -237,14 +417,14 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
 
         // due to being able to override the channel number, and NVR providing per channel port access,
         // do not actually use these channel ids, and just use it to determine the number of channels
-        // available for a camera.q
+        // available for a camera.
         const ret = [];
         let index = 0;
         const cameraNumber = this.getCameraNumber();
         for (const [id, channel] of detectedChannels.entries()) {
             if (cameraNumber && channelToCameraNumber(id) !== cameraNumber)
                 continue;
-            const mso = this.createRtspMediaStreamOptions(`rtsp://${this.getRtspAddress()}/ISAPI/Streaming/channels/${id}/${params}`, index++);
+            const mso = createRtspMediaStreamOptions(`rtsp://${this.getRtspAddress()}/ISAPI/Streaming/channels/${id}/${params}`, index++);
             Object.assign(mso.video, channel?.video);
             mso.tool = 'scrypted';
             ret.push(mso);
@@ -257,11 +437,7 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
         return false;
     }
 
-    async putSetting(key: string, value: string) {
-        this.client = undefined;
-        this.detectedChannels = undefined;
-        super.putSetting(key, value);
-
+    updateDevice() {
         const doorbellType = this.storage.getItem('doorbellType');
         const isDoorbell = doorbellType === 'true';
 
@@ -279,9 +455,36 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
             interfaces.push(ScryptedInterface.Intercom);
         }
 
-        this.provider.updateDevice(this.nativeId, this.name, interfaces, type);
+        if (this.hasSmartDetection)
+            interfaces.push(ScryptedInterface.ObjectDetector);
 
-        this.updateManagementUrl();
+        if (this.hasFloodlight || this.hasAlarm) {
+            interfaces.push(ScryptedInterface.DeviceProvider);
+        }
+
+        this.provider.updateDevice(this.nativeId, this.name, interfaces, type);
+    }
+
+    async putSetting(key: string, value: string) {
+        if (key === automaticallyConfigureSettings.key) {
+            const client = this.getClient();
+            autoconfigureSettings(client, this.getCameraNumber() || '1')
+                .then(() => {
+                    this.log.a('Successfully configured settings.');
+                })
+                .catch(e => {
+                    this.log.a('There was an error automatically configuring settings. More information can be viewed in the console.');
+                    this.console.error('error autoconfiguring', e);
+                });
+            return;
+        }
+
+        this.client = undefined;
+        this.detectedChannels = undefined;
+        super.putSetting(key, value);
+
+        this.updateDevice();
+        this.updateDeviceInfo();
     }
 
     async getOtherSettings(): Promise<Setting[]> {
@@ -305,27 +508,9 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
         if (!twoWayAudio)
             twoWayAudio = isDoorbell ? 'Hikvision' : 'None';
 
-        ret.unshift(
-            {
-                group: 'Advanced',
-                key: 'motionTimeout',
-                title: 'Motion Timeout',
-                description: 'Duration to report motion after the last motion ping.',
-                value: parseInt(this.storage.getItem('motionTimeout')) || 10,
-                type: 'number',
-            },
-            {
-                group: 'Advanced',
-                key: 'motionPings',
-                title: 'Motion Ping Count',
-                description: 'Number of motion pings needed to trigger motion.',
-                value: parseInt(this.storage.getItem('motionPings')) || 1,
-                type: 'number',
-            },
-        );
-
         ret.push(
             {
+                subgroup: 'Advanced',
                 title: 'Doorbell',
                 type: 'boolean',
                 description: 'This device is a Hikvision doorbell.',
@@ -333,6 +518,7 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
                 key: 'doorbellType',
             },
             {
+                subgroup: 'Advanced',
                 title: 'Two Way Audio',
                 value: twoWayAudio,
                 key: 'twoWayAudio',
@@ -341,19 +527,83 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
             },
         );
 
+        const ac = {
+            ...automaticallyConfigureSettings,
+            subgroup: 'Advanced',
+        };
+        ac.type = 'button';
+        ret.push(ac);
+        ret.push({
+            ...hikvisionAutoConfigureSettings,
+            subgroup: 'Advanced',
+        });
+
         return ret;
     }
 
+    async reportDevices() {
+        const devices: Device[] = [];
+
+        if (await this.hasAlarm()) {
+            const alarmNativeId = `${this.nativeId}-alarm`;
+            const alarmDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} Alarm`,
+                nativeId: alarmNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.OnOff,
+                    ScryptedInterface.Settings,
+                ],
+                type: ScryptedDeviceType.Switch,
+            };
+            devices.push(alarmDevice);
+        }
+
+        if (await this.hasFloodlight()) {
+            const floodlightNativeId = `${this.nativeId}-floodlight`;
+            const floodlightDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} Floodlight`,
+                nativeId: floodlightNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.OnOff,
+                    ScryptedInterface.Brightness,
+                    ScryptedInterface.Settings,
+                ],
+                type: ScryptedDeviceType.Light,
+            };
+            devices.push(floodlightDevice);
+        }
+        sdk.deviceManager.onDevicesChanged({
+            providerNativeId: this.nativeId,
+            devices
+        });
+    }
+
+    async getDevice(nativeId: string): Promise<any> {
+        if (nativeId.endsWith('-floodlight')) {
+            this.floodlight ||= new HikvisionSupplementalLight(this, nativeId);
+            return this.floodlight;
+        }
+        if (nativeId.endsWith('-alarm')) {
+            this.alarm ||= new HikvisionAlarmSwitch(this, nativeId);
+            return this.alarm;
+        }
+    }
 
     async startIntercom(media: MediaObject): Promise<void> {
         if (this.storage.getItem('twoWayAudio') === 'ONVIF') {
+            this.activeIntercom?.kill();
+            this.activeIntercom = undefined;
             const options = await this.getConstructedVideoStreamOptions();
             const stream = options[0];
-            const url = new URL(stream.url);
-            // amcrest onvif requires this proto query parameter, or onvif two way
-            // will not activate.
-            url.searchParams.set('proto', 'Onvif');
-            this.onvifIntercom.url = url.toString();
+            this.onvifIntercom.url = stream.url;
             return this.onvifIntercom.startIntercom(media);
         }
 
@@ -363,12 +613,12 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
 
         try {
             const parameters = `http://${this.getHttpAddress()}/ISAPI/System/TwoWayAudio/channels`;
-            const { data: parametersData } = await this.getClient().digestAuth.request({
-                httpsAgent: hikvisionHttpsAgent,
+            const { body } = await this.getClient().request({
                 url: parameters,
+                responseType: 'text',
             });
 
-            const parsedXml = await xml2js.parseStringPromise(parametersData);
+            const parsedXml = await xml2js.parseStringPromise(body);
             for (const twoWayChannel of parsedXml.TwoWayAudioChannelList.TwoWayAudioChannel) {
                 const [id] = twoWayChannel.id;
                 if (id !== channel)
@@ -377,7 +627,7 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
             }
         }
         catch (e) {
-            this.console.error('Fialure while determining two way audio codec', e);
+            this.console.error('Failure while determining two way audio codec', e);
         }
 
         if (codec === 'G.711ulaw') {
@@ -402,100 +652,105 @@ class HikVisionCamera extends RtspSmartCamera implements Camera, Intercom {
         const buffer = await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput);
         const ffmpegInput = JSON.parse(buffer.toString()) as FFmpegInput;
 
-        const args = ffmpegInput.inputArguments.slice();
-        args.unshift('-hide_banner');
-
-        args.push(
-            "-vn",
-            '-ar', '8000',
-            '-ac', '1',
-            '-acodec', codec,
-            '-f', format,
-            'pipe:3',
-        );
-
-        this.console.log('ffmpeg intercom', args);
-
-        const ffmpeg = await mediaManager.getFFmpegPath();
-        this.cp = child_process.spawn(ffmpeg, args, {
-            stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+        const passthrough = new PassThrough();
+        const open = `http://${this.getHttpAddress()}/ISAPI/System/TwoWayAudio/channels/${channel}/open`;
+        const { body } = await this.getClient().request({
+            url: open,
+            responseType: 'text',
+            method: 'PUT',
         });
-        this.cp.on('exit', () => this.cp = undefined);
-        ffmpegLogInitialOutput(this.console, this.cp);
-        const socket = this.cp.stdio[3] as Readable;
+        this.console.log('two way audio opened', body);
 
-        (async () => {
-            const passthrough = new PassThrough();
+        const url = `http://${this.getHttpAddress()}/ISAPI/System/TwoWayAudio/channels/${channel}/audioData`;
+        this.console.log('posting audio data to', url);
 
-            try {
-                const open = `http://${this.getHttpAddress()}/ISAPI/System/TwoWayAudio/channels/${channel}/open`;
-                const { data } = await this.getClient().digestAuth.request({
-                    httpsAgent: hikvisionHttpsAgent,
-                    method: 'PUT',
-                    url: open,
-                });
-                this.console.log('two way audio opened', data);
+        const put = this.getClient().request({
+            url,
+            method: 'PUT',
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                // 'Connection': 'close',
+                'Content-Length': '0'
+            },
+        }, passthrough);
 
-                const url = `http://${this.getHttpAddress()}/ISAPI/System/TwoWayAudio/channels/${channel}/audioData`;
-                this.console.log('posting audio data to', url);
-
-                // seems the dahua doorbells preferred 1024 chunks. should investigate adts
-                // parsing and sending multipart chunks instead.
-                this.getClient().digestAuth.request({
-                    httpsAgent: hikvisionHttpsAgent,
-                    method: 'PUT',
-                    url,
-                    headers: {
-                        'Content-Type': 'application/octet-stream',
-                        // 'Connection': 'close',
-                        'Content-Length': '0'
-                    },
-                    data: passthrough,
-                });
-
-
-                while (true) {
-                    const data = await readLength(socket, 1024);
-                    passthrough.push(data);
-                }
+        let available = Buffer.alloc(0);
+        this.activeIntercom?.kill();
+        const forwarder = this.activeIntercom = await startRtpForwarderProcess(this.console, ffmpegInput, {
+            audio: {
+                onRtp: rtp => {
+                    const parsed = RtpPacket.deSerialize(rtp);
+                    available = Buffer.concat([available, parsed.payload]);
+                    if (available.length > 1024) {
+                        passthrough.push(available.subarray(0, 1024));
+                        available = available.subarray(1024);
+                    }
+                },
+                codecCopy: codec,
+                encoderArguments: [
+                    '-ar', '8000',
+                    '-ac', '1',
+                    '-acodec', codec,
+                ]
             }
-            catch (e) {
-            }
-            finally {
-                this.console.log('audio finished');
-                passthrough.end();
-            }
+        });
 
+        forwarder.killPromise.finally(() => {
+            this.console.log('audio finished');
+            passthrough.end();
+            setTimeout(() => {
+                this.stopIntercom();
+            }, 1000);
+        });
+
+        put.finally(() => {
             this.stopIntercom();
-        })();
+        });
+
+        // the put request will be open until the passthrough is closed.
+        put.then(response => {
+            if (response.statusCode !== 200)
+                forwarder.kill();
+        })
+            .catch(() => forwarder.kill());
     }
 
-
     async stopIntercom(): Promise<void> {
+        this.activeIntercom?.kill();
+        this.activeIntercom = undefined;
+
         if (this.storage.getItem('twoWayAudio') === 'ONVIF') {
             return this.onvifIntercom.stopIntercom();
         }
 
         const client = this.getClient();
-        await client.digestAuth.request({
-            httpsAgent: hikvisionHttpsAgent,
-            method: 'PUT',
+        await client.request({
             url: `http://${this.getHttpAddress()}/ISAPI/System/TwoWayAudio/channels/${this.getRtspChannel() || '1'}/close`,
-        })
+            method: 'PUT',
+        });
     }
 }
 
-class HikVisionProvider extends RtspProvider {
-    clients: Map<string, HikVisionCameraAPI>;
+class HikvisionProvider extends RtspProvider {
+    clients: Map<string, HikvisionCameraAPI>;
 
-    constructor() {
-        super();
+    constructor(nativeId?: ScryptedNativeId) {
+        super(nativeId);
+        checkPluginNeedsAutoConfigure(this);
+    }
+
+    getScryptedDeviceCreator(): string {
+        return 'Hikvision Camera';
     }
 
     getAdditionalInterfaces() {
         return [
+            ScryptedInterface.VideoCameraConfiguration,
+            ScryptedInterface.Reboot,
             ScryptedInterface.Camera,
             ScryptedInterface.MotionSensor,
+            ScryptedInterface.VideoTextOverlays,
         ];
     }
 
@@ -507,14 +762,109 @@ class HikVisionProvider extends RtspProvider {
         const check = this.clients.get(key);
         if (check)
             return check;
-        const client = new HikVisionCameraAPI(address, username, password, this.console);
+        const client = new HikvisionCameraAPI(address, username, password, this.console);
         this.clients.set(key, client);
         return client;
     }
 
     createCamera(nativeId: string) {
-        return new HikVisionCamera(nativeId, this);
+        return new HikvisionCamera(nativeId, this);
+    }
+
+    async createDevice(settings: DeviceCreatorSettings, nativeId?: string): Promise<string> {
+        const httpAddress = `${settings.ip}:${settings.httpPort || 80}`;
+        let info: DeviceInformation = {};
+
+        const username = settings.username?.toString();
+        const password = settings.password?.toString();
+
+        const api = new HikvisionCameraAPI(httpAddress, username, password, this.console);
+
+        if (settings.autoconfigure) {
+            const cameraNumber = (settings.rtspChannel as string)?.substring(0, 1) || '1';
+            await autoconfigureSettings(api, cameraNumber);
+        }
+
+        const skipValidate = settings.skipValidate?.toString() === 'true';
+        let twoWayAudio: string;
+        if (!skipValidate) {
+            try {
+                const deviceInfo = await api.getDeviceInfo();
+
+                settings.newCamera = deviceInfo.deviceName;
+                info.model = deviceInfo.deviceModel;
+                // info.manufacturer = 'Hikvision';
+                info.mac = deviceInfo.macAddress;
+                info.firmware = deviceInfo.firmwareVersion;
+                info.serialNumber = deviceInfo.serialNumber;
+            }
+            catch (e) {
+                this.console.error('Error adding Hikvision camera', e);
+                throw e;
+            }
+
+            try {
+                if (await api.checkTwoWayAudio()) {
+                    twoWayAudio = 'Hikvision';
+                }
+            }
+            catch (e) {
+                this.console.warn('Error probing two way audio', e);
+            }
+        }
+        settings.newCamera ||= 'Hikvision Camera';
+
+        nativeId = await super.createDevice(settings, nativeId);
+
+        const device = await this.getDevice(nativeId) as HikvisionCamera;
+        device.info = info;
+        device.putSetting('username', username);
+        device.putSetting('password', password);
+        if (settings.rtspChannel)
+            device.putSetting('rtspChannel', settings.rtspChannel as string);
+        device.setHttpPortOverride(settings.httpPort?.toString());
+        device.setIPAddress(settings.ip?.toString());
+        if (twoWayAudio)
+            device.putSetting('twoWayAudio', twoWayAudio);
+        device.updateDeviceInfo();
+        return nativeId;
+    }
+
+    async getCreateDeviceSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'username',
+                title: 'Username',
+            },
+            {
+                key: 'password',
+                title: 'Password',
+                type: 'password',
+            },
+            {
+                key: 'ip',
+                title: 'IP Address',
+                placeholder: '192.168.2.222',
+            },
+            rtspChannelSetting,
+            {
+                subgroup: 'Advanced',
+                key: 'httpPort',
+                title: 'HTTP Port',
+                description: 'Optional: Override the HTTP Port from the default value of 80.',
+                placeholder: '80',
+            },
+            automaticallyConfigureSettings,
+            hikvisionAutoConfigureSettings,
+            {
+                subgroup: 'Advanced',
+                key: 'skipValidate',
+                title: 'Skip Validation',
+                description: 'Add the device without verifying the credentials and network settings.',
+                type: 'boolean',
+            }
+        ]
     }
 }
 
-export default new HikVisionProvider();
+export default HikvisionProvider;

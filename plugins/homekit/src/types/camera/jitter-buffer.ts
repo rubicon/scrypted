@@ -1,4 +1,17 @@
-import type { RtpPacket } from "@koush/werift-src/packages/rtp/src/rtp/rtp";
+/**
+ * This is a subset of Werift's RtpPacket.
+ */
+export interface RtpPacket {
+    payload: Buffer;
+    header: {
+        padding: boolean;
+        marker: boolean;
+        timestamp: number;
+        sequenceNumber: number;
+    };
+    clone(): RtpPacket;
+    serialize(): Buffer;
+}
 
 export function sequenceNumberDistance(s1: number, s2: number): number {
     if (s2 === s1)
@@ -17,6 +30,11 @@ export function sequenceNumberDistance(s1: number, s2: number): number {
 
 export function nextSequenceNumber(current: number, increment = 1) {
     return (current + increment + 0x10000) % 0x10000;
+}
+
+const maxRtpTimestamp = BigInt(0xFFFFFFFF);
+export function addRtpTimestamp(current: number, adjust: number) {
+    return Number(maxRtpTimestamp & (BigInt(current) + BigInt(adjust)));
 }
 
 export function isNextSequenceNumber(current: number, next: number) {
@@ -77,7 +95,7 @@ export class JitterBuffer {
 
         // missed/late bunch of packets
         if (packetDistance > this.jitterSize) {
-            this.console.log('jitter buffer skipped packets:', packetDistance);
+            // this.console.log('jitter buffer skipped packets:', packetDistance);
             const { lastSequenceNumber } = this;
             this.lastSequenceNumber = sequenceNumber - this.jitterSize;
             // use the previous sequence number to flush any packets that are too old compared

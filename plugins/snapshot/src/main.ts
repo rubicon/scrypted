@@ -1,16 +1,22 @@
-import AxiosDigestAuth from '@koush/axios-digest-auth';
 import { AutoenableMixinProvider } from "@scrypted/common/src/autoenable-mixin-provider";
-import { RefreshPromise, singletonPromise, TimeoutError, timeoutPromise } from "@scrypted/common/src/promise-utils";
-import { StorageSettings } from "@scrypted/sdk/storage-settings";
+import { AuthFetchCredentialState, authHttpFetch } from '@scrypted/common/src/http-auth-fetch';
+import { RefreshPromise, TimeoutError, createMapPromiseDebouncer, singletonPromise, timeoutPromise } from "@scrypted/common/src/promise-utils";
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from "@scrypted/common/src/settings-mixin";
-import sdk, { BufferConverter, BufferConvertorOptions, Camera, FFmpegInput, MediaObject, MixinProvider, RequestMediaStreamOptions, RequestPictureOptions, ResponsePictureOptions, ScryptedDevice, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue, VideoCamera } from "@scrypted/sdk";
-import axios, { Axios } from "axios";
+import sdk, { BufferConverter, Camera, DeviceManifest, DeviceProvider, FFmpegInput, HttpRequest, HttpRequestHandler, HttpResponse, MediaObject, MediaObjectOptions, MixinProvider, RequestMediaStreamOptions, RequestPictureOptions, ResponsePictureOptions, ScryptedDevice, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue, Settings, Sleep, VideoCamera, WritableDeviceState } from "@scrypted/sdk";
+import { StorageSettings } from "@scrypted/sdk/storage-settings";
 import https from 'https';
+import os from 'os';
 import path from 'path';
-import MimeType from 'whatwg-mimetype';
+import url from 'url';
 import { ffmpegFilterImage, ffmpegFilterImageBuffer } from './ffmpeg-image-filter';
+import { ImageConverter, ImageConverterNativeId } from './image-converter';
+import { ImageReader, ImageReaderNativeId, loadSharp, loadVipsImage } from './image-reader';
+import { ImageWriter, ImageWriterNativeId } from './image-writer';
 
 const { mediaManager, systemManager } = sdk;
+if (os.cpus().find(cpu => cpu.model?.toLowerCase().includes('qemu'))) {
+    sdk.log.a('QEMU CPU detected. Set your CPU model to host.');
+}
 
 const httpsAgent = new https.Agent({
     rejectUnauthorized: false
@@ -67,27 +73,17 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
             description: (this.mixinDeviceInterfaces.includes(ScryptedInterface.Camera)
                 ? 'Optional: '
                 : '')
-                + 'The http(s) URL that points that retrieves the latest image from your camera.',
+                + 'The http(s) URL that retrieves a jpeg image from your camera.',
             placeholder: 'https://ip:1234/cgi-bin/snapshot.jpg',
         },
         snapshotsFromPrebuffer: {
             title: 'Snapshots from Prebuffer',
-            description: 'Prefer snapshots from the Rebroadcast Plugin prebuffer when available. This setting uses considerable CPU to convert a video stream into a snapshot.',
-            type: 'boolean',
-            defaultValue: !this.mixinDeviceInterfaces.includes(ScryptedInterface.Camera),
-        },
-        snapshotMode: {
-            title: 'Snapshot Mode',
-            description: 'Set the snapshot mode to accomodate cameras with slow snapshots that may hang HomeKit.\nSetting the mode to "Never Wait" will only use recently available snapshots.\nSetting the mode to "Timeout" will cancel slow snapshots.',
+            description: 'Prefer snapshots from the Rebroadcast Plugin prebuffer when available. This setting uses considerable CPU to convert a video stream into a snapshot. The Default setting will use the camera snapshot and fall back to prebuffer on failure.',
             choices: [
                 'Default',
-                'Never Wait',
-                'Timeout',
+                'Enabled',
+                'Disabled',
             ],
-            mapGet(value) {
-                // renamed the setting value.
-                return value === 'Normal' ? 'Default' : value;
-            },
             defaultValue: 'Default',
         },
         snapshotResolution: {
@@ -107,249 +103,380 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
             type: 'clippath',
         },
     });
-    axiosClient: Axios | AxiosDigestAuth;
-    pendingPicture: Promise<Buffer>;
+    snapshotDebouncer = createMapPromiseDebouncer<{
+        picture: Buffer;
+        pictureTime: number;
+    }>();
     errorPicture: RefreshPromise<Buffer>;
     timeoutPicture: RefreshPromise<Buffer>;
     progressPicture: RefreshPromise<Buffer>;
     prebufferUnavailablePicture: RefreshPromise<Buffer>;
     currentPicture: Buffer;
+    currentPictureTime = 0;
     lastErrorImagesClear = 0;
     static lastGeneratedErrorImageTime = 0;
     lastAvailablePicture: Buffer;
+    psos: ResponsePictureOptions[];
 
-    constructor(options: SettingsMixinDeviceOptions<Camera>) {
+    constructor(public plugin: SnapshotPlugin, options: SettingsMixinDeviceOptions<Camera>) {
         super(options);
     }
 
-    async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        const eventSnapshot = options?.reason === 'event';
-        let needSoftwareResize = !!(options?.picture?.width || options?.picture?.height);
+    get debugConsole() {
+        if (this.plugin.debugConsole)
+            return this.console;
+    }
 
-        let takePicture: (options?: RequestPictureOptions) => Promise<Buffer>;
-        if (this.storageSettings.values.snapshotsFromPrebuffer) {
+    async takePictureInternal(id: string, eventSnapshot: boolean): Promise<Buffer> {
+        this.debugConsole?.log("Picture requested from camera", { id, eventSnapshot });
+        const { snapshotsFromPrebuffer } = this.storageSettings.values;
+        let usePrebufferSnapshots: boolean;
+        switch (snapshotsFromPrebuffer) {
+            case 'true':
+            case 'Enabled':
+                usePrebufferSnapshots = true;
+                break;
+            case 'Disabled':
+                usePrebufferSnapshots = false;
+                break;
+            default:
+                // default behavior is to use a prebuffer snapshot if there's no camera interface and
+                // no explicit snapshot url.
+                if (!this.mixinDeviceInterfaces.includes(ScryptedInterface.Camera) && !this.storageSettings.values.snapshotUrl)
+                    usePrebufferSnapshots = true;
+                break;
+        }
+
+        // unifi cameras send stale snapshots which are unusable for events,
+        // so force a prebuffer snapshot in this instance.
+        // if prebuffer is not available, it will fall back.
+        if (eventSnapshot && usePrebufferSnapshots !== false) {
             try {
-                const realDevice = systemManager.getDeviceById<VideoCamera>(this.id);
-                const msos = await realDevice.getVideoStreamOptions();
-                let prebufferChannel = msos?.find(mso => mso.prebuffer);
-                if (prebufferChannel || !this.lastAvailablePicture) {
-                    prebufferChannel = prebufferChannel || {
-                        id: undefined,
-                    };
-
-                    const request = prebufferChannel as RequestMediaStreamOptions;
-                    // specify the prebuffer based on the usage. events shouldn't request
-                    // lengthy prebuffers as it may not contain the image it needs.
-                    request.prebuffer = eventSnapshot ? 1000 : 6000;
-                    if (this.lastAvailablePicture)
-                        request.refresh = false;
-                    takePicture = async () => mediaManager.convertMediaObjectToBuffer(await realDevice.getVideoStream(request), 'image/jpeg');
-                    this.console.log('snapshotting active prebuffer');
+                const psos = await this.getPictureOptions();
+                if (psos?.[0]?.staleDuration) {
+                    usePrebufferSnapshots = true;
                 }
             }
             catch (e) {
             }
         }
 
-        if (!takePicture) {
-            if (!this.storageSettings.values.snapshotUrl) {
-                if (this.mixinDeviceInterfaces.includes(ScryptedInterface.Camera)) {
-                    takePicture = async (options?: RequestPictureOptions) => {
-                        const internalTakePicture = async () => {
-                            if (!options?.id && this.storageSettings.values.defaultSnapshotChannel !== 'Camera Default') {
-                                try {
-                                    if (!psos)
-                                        psos = await this.mixinDevice.getPictureOptions();
-                                    const pso = psos.find(pso => pso.name === this.storageSettings.values.defaultSnapshotChannel);
-                                    if (!options)
-                                        options = {};
-                                    options.id = pso.id;
-                                }
-                                catch (e) {
-                                }
-                            }
-                            return this.mixinDevice.takePicture(options).then(mo => mediaManager.convertMediaObjectToBuffer(mo, 'image/jpeg'))
-                        }
+        const realDevice = systemManager.getDeviceById<VideoCamera & Sleep>(this.id);
 
-                        // full resolution setging ignores resize.
-                        if (this.storageSettings.values.snapshotResolution === 'Full Resolution') {
-                            if (options)
-                                options.picture = undefined;
-                            return internalTakePicture();
-                        }
+        let takePrebufferPicture: () => Promise<Buffer>;
+        const preparePrebufferSnapshot = async () => {
+            if (takePrebufferPicture)
+                return takePrebufferPicture;
+            const msos = await realDevice.getVideoStreamOptions();
+            let prebufferChannel = msos?.find(mso => mso.prebuffer);
+            if (prebufferChannel || !this.lastAvailablePicture) {
+                prebufferChannel = prebufferChannel || {
+                    id: undefined,
+                };
 
-                        // if resize wasn't requested, continue as normal.
-                        const resizeRequested = !!options?.picture;
-                        if (!resizeRequested)
-                            return internalTakePicture();
+                const request = prebufferChannel as RequestMediaStreamOptions;
+                // specify the prebuffer based on the usage. events shouldn't request
+                // lengthy prebuffers as it may not contain the image it needs.
+                request.prebuffer = eventSnapshot ? 1000 : 6000;
+                if (this.lastAvailablePicture)
+                    request.refresh = false;
+                takePrebufferPicture = async () => {
+                    // this.console.log('snapshotting active prebuffer');
+                    const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(await realDevice.getVideoStream(request), ScryptedMimeTypes.FFmpegInput);
+                    return ffmpegFilterImage(ffmpegInput.inputArguments, {
+                        console: this.debugConsole,
+                        ffmpegPath: await mediaManager.getFFmpegPath(),
+                        timeout: 10000,
+                    });
+                };
+                return takePrebufferPicture;
+            }
+        }
 
-                        // resize was requested
+        if (usePrebufferSnapshots) {
+            const takePicture = await preparePrebufferSnapshot()
+            if (!takePicture) {
+                this.debugConsole?.warn('Prebuffer snapshot was requested but prebuffer is unavailable.');
+                throw new PrebufferUnavailableError();
+            }
+            return takePicture();
+        }
 
-                        // crop and scale needs to operate on the full resolution image.
-                        if (this.storageSettings.values.snapshotCropScale?.length) {
-                            options.picture = undefined;
-                            // resize after the cop and scale.
-                            needSoftwareResize = resizeRequested;
-                            return internalTakePicture();
-                        }
+        const retryWithPrebuffer = async (e: Error) => {
+            if (usePrebufferSnapshots === false)
+                throw e;
+            const takePicture = await preparePrebufferSnapshot()
+            if (!takePicture)
+                throw e;
+            this.console.error('Snapshot failed, falling back to prebuffer', e);
+            return takePicture();
+        }
 
-                        //  determine see if that can be handled by camera hardware
-                        let psos: ResponsePictureOptions[];
-                        try {
-                            if (!psos)
-                                psos = await this.mixinDevice.getPictureOptions();
-                            if (!psos?.[0]?.canResize) {
-                                needSoftwareResize = true;
-                            }
-                        }
-                        catch (e) {
-                        }
+        if (this.storageSettings.values.snapshotUrl) {
+            let username: string;
+            let password: string;
 
-                        if (needSoftwareResize)
-                            options.picture = undefined;
+            if (this.mixinDeviceInterfaces.includes(ScryptedInterface.Settings)) {
+                const settings = await this.mixinDevice.getSettings();
+                username = settings?.find(setting => setting.key === 'username')?.value?.toString();
+                password = settings?.find(setting => setting.key === 'password')?.value?.toString();
+            }
 
-                        return internalTakePicture();
+            let credential: AuthFetchCredentialState;
+            if (username && password) {
+                credential = {
+                    username,
+                    password,
+                };
+            }
+
+            try {
+                const response = await authHttpFetch({
+                    rejectUnauthorized: false,
+                    url: this.storageSettings.values.snapshotUrl,
+                    credential,
+                    timeout: 60000,
+                    headers: {
+                        'Accept': 'image/*',
+                    },
+                });
+
+                return response.body;
+            }
+            catch (e) {
+                return retryWithPrebuffer(e);
+            }
+        }
+
+        if (this.mixinDeviceInterfaces.includes(ScryptedInterface.Camera)) {
+            let takePictureOptions: RequestPictureOptions;
+            if (!id && this.storageSettings.values.defaultSnapshotChannel !== 'Camera Default') {
+                try {
+                    const psos = await this.getPictureOptions();
+                    const pso = psos.find(pso => pso.name === this.storageSettings.values.defaultSnapshotChannel);
+                    takePictureOptions = {
+                        id: pso?.id,
                     };
                 }
-                else if (this.storageSettings.values.snapshotsFromPrebuffer) {
-                    takePicture = async () => {
-                        throw new PrebufferUnavailableError();
-                    }
-                }
-                else {
-                    takePicture = () => {
-                        throw new Error('Snapshot Unavailable (snapshotUrl empty)');
-                    }
-                }
-            }
-            else {
-                if (!this.axiosClient) {
-                    let username: string;
-                    let password: string;
-
-                    if (this.mixinDeviceInterfaces.includes(ScryptedInterface.Settings)) {
-                        const settings = await this.mixinDevice.getSettings();
-                        username = settings?.find(setting => setting.key === 'username')?.value?.toString();
-                        password = settings?.find(setting => setting.key === 'password')?.value?.toString();
-                    }
-
-                    if (username && password) {
-                        this.axiosClient = new AxiosDigestAuth({
-                            username,
-                            password,
-                        });
-                    }
-                    else {
-                        this.axiosClient = axios;
-                    }
-                }
-
-                takePicture = () => this.axiosClient.request({
-                    httpsAgent,
-                    method: "GET",
-                    responseType: 'arraybuffer',
-                    url: this.storageSettings.values.snapshotUrl,
-                }).then(async (response: { data: any; }) => response.data);
-            }
-        }
-
-        const isFullImage = !needSoftwareResize;
-        let pendingPicture = this.pendingPicture;
-        if (!pendingPicture || !isFullImage) {
-            pendingPicture = (async () => {
-                let picture: Buffer;
-                try {
-                    picture = await takePicture(options ? {
-                        ...options,
-                    } : undefined);
-                    picture = await this.cropAndScale(picture);
-                    if (needSoftwareResize) {
-                        picture = await ffmpegFilterImageBuffer(picture, {
-                            ffmpegPath: await mediaManager.getFFmpegPath(),
-                            resize: options?.picture,
-                            timeout: 10000,
-                        });
-                    }
-                    this.clearCachedPictures();
-                    this.currentPicture = picture;
-                    this.lastAvailablePicture = picture;
-                    setTimeout(() => {
-                        if (this.currentPicture === picture) {
-                            // only clear the current picture after it times out,
-                            // the plugin shouldn't invalidate error, timeout, progress
-                            // images unless the current picture is updated.
-                            this.currentPicture = undefined;
-                        }
-                    }, 60000);
-                }
                 catch (e) {
-                    // allow reusing the current picture to mask errors
-                    picture = await this.createErrorImage(e);
                 }
-                return picture;
-            })();
-
-            if (isFullImage)
-                this.pendingPicture = pendingPicture;
-
-            // don't allow a snapshot to take longer than 1 minute.
-            const failureTimeout = setTimeout(() => {
-                if (this.pendingPicture === pendingPicture)
-                    this.pendingPicture = undefined;
-            }, 60000);
-            // prevent infinite loop from onDeviceEvent triggering picture updates.
-            // retain this promise for a bit while everything settles.
-            // this also has a side effect of only allowing snapshots every 5 seconds.
-            pendingPicture.finally(() => {
-                clearTimeout(failureTimeout);
-                if (this.pendingPicture === pendingPicture)
-                    this.pendingPicture = undefined;
-            });
-        }
-
-        let { snapshotMode } = this.storageSettings.values;
-        if (eventSnapshot) {
-            // event snapshots must be fulfilled
-            snapshotMode = 'Default';
-        }
-        else if (snapshotMode === 'Never Wait' && !options?.periodicRequest) {
-            // non periodic snapshots should use a short timeout.
-            snapshotMode = 'Timeout';
-        }
-
-        let data: Buffer;
-        try {
-            switch (snapshotMode) {
-                case 'Never Wait':
-                    throw new NeverWaitError();
-                case 'Timeout':
-                    data = await timeoutPromise(1000, pendingPicture);
-                    break;
-                default:
-                    data = await pendingPicture;
-                    break;
+            }
+            try {
+                // consider waking the camera if 
+                if (!eventSnapshot && this.mixinDeviceInterfaces.includes(ScryptedInterface.Sleep) && realDevice.sleeping)
+                    throw new Error('Not waking sleeping camera for periodic snapshot.');
+                return await this.mixinDevice.takePicture(takePictureOptions).then(mo => mediaManager.convertMediaObjectToBuffer(mo, 'image/jpeg'))
+            }
+            catch (e) {
+                return retryWithPrebuffer(e);
             }
         }
-        catch (e) {
-            // allow reusing the current picture to mask errors
-            if (this.currentPicture)
-                data = this.currentPicture;
-            else
-                data = await this.createErrorImage(e);
-        }
-        return this.createMediaObject(Buffer.from(data), 'image/jpeg');
+
+        throw new Error('Snapshot Unavailable (Snapshot URL empty)');
     }
 
-    async cropAndScale(buffer: Buffer) {
+    async takePictureRaw(options?: RequestPictureOptions): Promise<Buffer> {
+        const eventSnapshot = options?.reason === 'event';
+        const periodicSnapshot = options?.reason === 'periodic';
+
+        // clear out snapshots that are too old.
+        if (this.currentPictureTime < Date.now() - 1 * 60 * 60 * 1000)
+            this.currentPicture = undefined;
+
+        // always grab/debounce a snapshot
+        // event snapshot are special and should immediately expire.
+        // other snapshots may be debounced for 4s.
+        const debounced = this.snapshotDebouncer({
+            id: options?.id,
+            type: 'source',
+            event: options?.reason === 'event',
+        }, eventSnapshot ? 0 : 4000, async () => {
+            const snapshotTimer = Date.now();
+            let picture = await this.takePictureInternal(undefined, eventSnapshot);
+            picture = await this.cropAndScale(picture);
+            this.clearCachedPictures();
+            const pictureTime = Date.now();
+            this.currentPicture = picture;
+            this.currentPictureTime = pictureTime;
+            this.lastAvailablePicture = picture;
+            this.debugConsole?.debug(`Periodic snapshot took ${(this.currentPictureTime - snapshotTimer) / 1000} seconds to retrieve.`)
+            return {
+                picture,
+                pictureTime,
+            };
+        });
+        debounced.catch(() => { });
+
+        // prevent this from expiring
+        let availablePicture = this.currentPicture;
+        let availablePictureTime = this.currentPictureTime;
+
+        let rawPicture: Awaited<typeof debounced>;
+        try {
+            let pictureTimeout = options?.timeout;
+            if (!pictureTimeout) {
+                // determine a fetch timeout based on the reason and staleness
+                const allowedSnapshotStaleness = eventSnapshot ? 0 : periodicSnapshot ? 20000 : 10000;
+                if (!availablePicture) {
+                    // none available so wait a while
+                    pictureTimeout = 10000;
+                }
+                else {
+                    if (availablePictureTime > Date.now() - 3000) {
+                        // very recent, don't wait for too long
+                        pictureTimeout = 1000;
+                    }
+                    else if (availablePictureTime > Date.now() - allowedSnapshotStaleness) {
+                        // fairly recent so give it little time to get a fresh one
+                        // idr interval is typically 4000 for reference
+                        pictureTimeout = 3000;
+                    }
+                    else {
+                        // stale so wait a while
+                        pictureTimeout = 10000;
+                    }
+                }
+            }
+            rawPicture = await timeoutPromise(pictureTimeout, debounced);
+        }
+        catch (e) {
+            // a best effort was made to get a recent snapshot from cache or from a camera request,
+            // the cache request will never fail, but if the camera request fails,
+            // it may be ok to use a somewhat stale snapshot depending on reason.
+
+            // event snapshot requests must not use cache since they're for realtime processing by homekit and nvr.
+            if (eventSnapshot)
+                throw e;
+
+            if (this.currentPicture) {
+                // use the current picture if it is still available as it may be newer.
+                availablePicture = this.currentPicture;
+                availablePictureTime = this.currentPictureTime;
+            }
+
+            if (!availablePicture)
+                return this.createErrorImage(e);
+
+            this.console.warn('Snapshot failed, but recovered from cache', e);
+            rawPicture = {
+                picture: availablePicture,
+                pictureTime: availablePictureTime,
+            };
+
+            // gc
+            availablePicture = undefined;
+        }
+
+        const needSoftwareResize = !!(options?.picture?.width || options?.picture?.height) && this.storageSettings.values.snapshotResolution !== 'Full Resolution';
+
+        if (!needSoftwareResize)
+            return rawPicture.picture;
+
+        try {
+            const key = {
+                type: 'resize',
+                pictureTime: rawPicture.pictureTime,
+                needSoftwareResize: true,
+                picture: options.picture,
+            };
+            const ret = await this.snapshotDebouncer(key, 10000, async () => {
+                this.debugConsole?.log("Resizing picture from camera", key);
+
+                if (loadSharp()) {
+                    const vips = await loadVipsImage(rawPicture.picture, this.id);
+                    try {
+                        const ret = await vips.toBuffer({
+                            resize: options?.picture,
+                            format: 'jpg',
+                        });
+                        return {
+                            picture: ret,
+                            pictureTime: rawPicture.pictureTime,
+                        };
+                    }
+                    finally {
+                        vips.close();
+                    }
+                }
+
+                const ret = await ffmpegFilterImageBuffer(rawPicture.picture, {
+                    console: this.debugConsole,
+                    ffmpegPath: await mediaManager.getFFmpegPath(),
+                    resize: options?.picture,
+                    timeout: 10000,
+                });
+                return {
+                    picture: ret,
+                    pictureTime: rawPicture.pictureTime,
+                };
+            });
+
+            return ret.picture;
+        }
+        catch (e) {
+            if (eventSnapshot)
+                throw e;
+            return this.createErrorImage(e);
+        }
+    }
+
+    async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        return this.createMediaObject(await this.takePictureRaw(options), 'image/jpeg');
+    }
+
+    async cropAndScale(picture: Buffer) {
         if (!this.storageSettings.values.snapshotCropScale?.length)
-            return buffer;
+            return picture;
 
         const xmin = Math.min(...this.storageSettings.values.snapshotCropScale.map(([x, y]) => x)) / 100;
         const ymin = Math.min(...this.storageSettings.values.snapshotCropScale.map(([x, y]) => y)) / 100;
         const xmax = Math.max(...this.storageSettings.values.snapshotCropScale.map(([x, y]) => x)) / 100;
         const ymax = Math.max(...this.storageSettings.values.snapshotCropScale.map(([x, y]) => y)) / 100;
 
-        return ffmpegFilterImageBuffer(buffer, {
+        if (loadSharp()) {
+            const vips = await loadVipsImage(picture, this.id);
+            try {
+                const ret = await vips.toBuffer({
+                    crop: {
+                        left: xmin * vips.width,
+                        top: ymin * vips.height,
+                        width: (xmax - xmin) * vips.width,
+                        height: (ymax - ymin) * vips.height,
+                    },
+                    format: 'jpg',
+                });
+                return ret;
+            }
+            finally {
+                vips.close();
+            }
+        }
+
+        // try {
+        //     const mo = await mediaManager.createMediaObject(picture, 'image/jpeg');
+        //     const image = await mediaManager.convertMediaObject<Image>(mo, ScryptedMimeTypes.Image);
+        //     const left = image.width * xmin;
+        //     const width = image.width * (xmax - xmin);
+        //     const top = image.height * ymin;
+        //     const height = image.height * (ymax - ymin);
+
+        //     return await image.toBuffer({
+        //         crop: {
+        //             left,
+        //             width,
+        //             top,
+        //             height,
+        //         },
+        //         format: 'jpg',
+        //     });
+        // }
+        // catch (e) {
+        //     if (!e.message?.includes('no converter found'))
+        //         throw e;
+        // }
+
+        return ffmpegFilterImageBuffer(picture, {
+            console: this.debugConsole,
             ffmpegPath: await mediaManager.getFFmpegPath(),
             crop: {
                 fractional: true,
@@ -412,6 +539,7 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
             return this.progressPicture.promise;
         }
         else {
+            this.console.error('Snapshot failed', e);
             this.errorPicture = singletonPromise(this.errorPicture,
                 () => this.createTextErrorImage('Snapshot Failed'));
             return this.errorPicture.promise;
@@ -427,12 +555,12 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
         const fontFile = path.join(unzippedFs, 'Lato-Bold.ttf');
 
         if (!errorBackground) {
-            const black = path.join(unzippedFs, 'black.jpg');
             return ffmpegFilterImage([
-                '-i', black,
+                '-f', 'lavfi',
+                '-i', 'color=black:size=1920x1080',
             ], {
+                console: this.debugConsole,
                 ffmpegPath: await mediaManager.getFFmpegPath(),
-                blur: true,
                 text: {
                     fontFile,
                     text,
@@ -442,6 +570,7 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
         }
         else {
             return ffmpegFilterImageBuffer(errorBackground, {
+                console: this.debugConsole,
                 ffmpegPath: await mediaManager.getFFmpegPath(),
                 blur: true,
                 brightness: -.2,
@@ -455,7 +584,9 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
     }
 
     async getPictureOptions() {
-        return this.mixinDevice.getPictureOptions();
+        if (!this.psos)
+            this.psos = await this.mixinDevice.getPictureOptions();
+        return this.psos;
     }
 
     getMixinSettings(): Promise<Setting[]> {
@@ -467,92 +598,164 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
     }
 }
 
-type DimDict<T extends string> = {
-    [key in T]: string;
-};
+export class SnapshotPlugin extends AutoenableMixinProvider implements MixinProvider, BufferConverter, Settings, DeviceProvider, HttpRequestHandler {
+    storageSettings = new StorageSettings(this, {
+        debugLogging: {
+            title: 'Debug Logging',
+            description: 'Debug logging for all cameras will be shown in the Snapshot Plugin Console.',
+            type: 'boolean',
+        },
+    });
+    mixinDevices = new Map<string, SnapshotMixin>();
+    authenticatedPath = sdk.endpointManager.getAuthenticatedPath(this.nativeId)
 
-export function parseDims<T extends string>(dict: DimDict<T>) {
-    const ret: {
-        [key in T]?: number;
-    } & {
-        fractional?: boolean;
-    } = {
-    };
-
-    for (const t of Object.keys(dict)) {
-        const val = dict[t as T];
-        if (val?.endsWith('%')) {
-            ret.fractional = true;
-            ret[t] = parseFloat(val?.substring(0, val?.length - 1)) / 100;
-        }
-        else {
-            ret[t] = parseFloat(val);
-        }
-    }
-    return ret;
-}
-
-class SnapshotPlugin extends AutoenableMixinProvider implements MixinProvider, BufferConverter {
     constructor(nativeId?: string) {
         super(nativeId);
 
-        this.fromMimeType = ScryptedMimeTypes.FFmpegInput;
-        this.toMimeType = 'image/jpeg';
+        this.fromMimeType = ScryptedMimeTypes.SchemePrefix + 'scrypted-media' + ';converter-weight=0';
+        this.toMimeType = ScryptedMimeTypes.LocalUrl;
+
+        const manifest: DeviceManifest = {
+            devices: [
+                {
+                    name: 'Image Writer',
+                    interfaces: [
+                        ScryptedInterface.BufferConverter,
+                    ],
+                    type: ScryptedDeviceType.Builtin,
+                    nativeId: ImageWriterNativeId,
+                },
+                {
+                    name: 'Image Converter',
+                    interfaces: [
+                        ScryptedInterface.BufferConverter,
+                    ],
+                    type: ScryptedDeviceType.Builtin,
+                    nativeId: ImageConverterNativeId,
+                }
+            ],
+        };
+
+        if (loadSharp()) {
+            manifest.devices.push(
+                {
+                    name: 'Image Reader',
+                    interfaces: [
+                        ScryptedInterface.BufferConverter,
+                    ],
+                    type: ScryptedDeviceType.Builtin,
+                    nativeId: ImageReaderNativeId,
+                }
+            );
+        }
+
+        process.nextTick(() => {
+            sdk.deviceManager.onDevicesChanged(manifest)
+        });
     }
 
-    async convert(data: any, fromMimeType: string, toMimeType: string, options?: BufferConvertorOptions): Promise<any> {
-        const mime = new MimeType(toMimeType);
+    async getDevice(nativeId: string): Promise<any> {
+        if (nativeId === ImageConverterNativeId)
+            return new ImageConverter(this, ImageConverterNativeId);
+        if (nativeId === ImageWriterNativeId)
+            return new ImageWriter(ImageWriterNativeId);
+        if (nativeId === ImageReaderNativeId)
+            return new ImageReader(ImageReaderNativeId);
+    }
 
-        const ffmpegInput = JSON.parse(data.toString()) as FFmpegInput;
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+    }
 
-        const args = [
-            ...ffmpegInput.inputArguments,
-            ...(ffmpegInput.h264EncoderArguments || []),
-        ];
+    getSettings(): Promise<Setting[]> {
+        return this.storageSettings.getSettings();
+    }
 
-        const {
-            width,
-            height,
-            fractional
-        } = parseDims({
-            width: mime.parameters.get('width'),
-            height: mime.parameters.get('height'),
-        });
+    putSetting(key: string, value: SettingValue): Promise<void> {
+        return this.storageSettings.putSetting(key, value);
+    }
 
-        const {
-            left,
-            top,
-            right,
-            bottom,
-            fractional: cropFractional,
-        } = parseDims({
-            left: mime.parameters.get('left'),
-            top: mime.parameters.get('top'),
-            right: mime.parameters.get('right'),
-            bottom: mime.parameters.get('bottom'),
-        });
+    get debugConsole() {
+        if (this.storageSettings.values.debugLogging)
+            return this.console;
+    }
 
-        return ffmpegFilterImage(args, {
-            ffmpegPath: await mediaManager.getFFmpegPath(),
-            resize: (isNaN(width) && isNaN(height))
-                ? undefined
-                : {
-                    width,
-                    height,
-                    fractional,
-                },
-            crop: (isNaN(left) && isNaN(top) && isNaN(right) && isNaN(bottom))
-                ? undefined
-                : {
-                    left,
-                    top,
-                    width: right - left,
-                    height: bottom - top,
-                    fractional: cropFractional,
-                },
-            timeout: 10000,
-            time: parseFloat(mime.parameters.get('time')),
-        });
+    async getLocalSnapshot(id: string, iface: string, search: string) {
+        const endpoint = await this.authenticatedPath;
+        const ret = url.resolve(path.join(endpoint, id, iface, `${Date.now()}.jpg`) + `${search}`, '');
+        return Buffer.from(ret);
+    }
+
+    async convert(data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions): Promise<any> {
+        const url = new URL(data.toString());
+        const id = url.hostname;
+        const path = url.pathname.split('/')[1];
+
+        if (path === ScryptedInterface.Camera) {
+            return this.getLocalSnapshot(id, path, url.search);
+        }
+        if (path === ScryptedInterface.VideoCamera) {
+            return this.getLocalSnapshot(id, path, url.search);
+        }
+        else {
+            throw new Error('Unrecognized Scrypted Media interface.')
+        }
+    }
+
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        if (request.isPublicEndpoint) {
+            response.send('', {
+                code: 404,
+            });
+            return;
+        }
+
+        const pathname = request.url.substring(request.rootPath.length);
+        const [_, id, iface] = pathname.split('/');
+        try {
+            if (iface !== ScryptedInterface.Camera && iface !== ScryptedInterface.VideoCamera)
+                throw new Error();
+
+            const search = new URLSearchParams(pathname.split('?')[1]);
+            const mixin = this.mixinDevices.get(id);
+            let buffer: Buffer;
+            let timeout = parseInt(search.get('timeout'));
+            // make web requests timeout after 5 seconds by default.
+            if (isNaN(timeout))
+                timeout = 5000;
+            const rpo: RequestPictureOptions = {
+                reason: search.get('reason') as 'event' | 'periodic',
+                timeout,
+                picture: {
+                    width: parseInt(search.get('width')) || undefined,
+                    height: parseInt(search.get('height')) || undefined,
+                }
+            };
+
+            if (mixin?.storageSettings.values.snapshotResolution === 'Full Resolution')
+                delete rpo.picture;
+
+            if (mixin && iface === ScryptedInterface.Camera) {
+                buffer = await mixin.takePictureRaw(rpo)
+            }
+            else {
+                const device = systemManager.getDeviceById<Camera & VideoCamera>(id);
+                const picture = iface === ScryptedInterface.Camera ? await device.takePicture(rpo) : await device.getVideoStream();
+                buffer = await mediaManager.convertMediaObjectToBuffer(picture, 'image/jpeg');
+            }
+
+            response.send(buffer, {
+                headers: {
+                    'Content-Type': 'image/jpeg',
+                    'Cache-Control': 'max-age=10',
+                }
+            });
+        }
+        catch (e) {
+            this.debugConsole?.error('snapshot http request failed', e);
+            response.send('', {
+                code: 500,
+            });
+        }
     }
 
     async canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[]> {
@@ -560,8 +763,9 @@ class SnapshotPlugin extends AutoenableMixinProvider implements MixinProvider, B
             return [ScryptedInterface.Camera, ScryptedInterface.Settings];
         return undefined;
     }
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any; }): Promise<any> {
-        return new SnapshotMixin({
+
+    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState): Promise<any> {
+        const ret = new SnapshotMixin(this, {
             mixinDevice,
             mixinDeviceInterfaces,
             mixinDeviceState,
@@ -569,6 +773,8 @@ class SnapshotPlugin extends AutoenableMixinProvider implements MixinProvider, B
             group: 'Snapshot',
             groupKey: 'snapshot',
         });
+        this.mixinDevices.set(ret.id, ret);
+        return ret;
     }
 
     async shouldEnableMixin(device: ScryptedDevice) {
@@ -581,6 +787,8 @@ class SnapshotPlugin extends AutoenableMixinProvider implements MixinProvider, B
     }
 
     async releaseMixin(id: string, mixinDevice: any): Promise<void> {
+        if (this.mixinDevices.get(id) === mixinDevice)
+            this.mixinDevices.delete(id);
         await mixinDevice.release()
     }
 }

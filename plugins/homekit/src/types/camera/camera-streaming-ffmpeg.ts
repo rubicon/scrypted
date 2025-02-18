@@ -6,6 +6,7 @@ import { getSpsPps } from '@scrypted/common/src/sdp-utils';
 import { FFmpegInput, MediaStreamDestination, ScryptedDevice, VideoCamera } from '@scrypted/sdk';
 import { RtpTrack, RtpTracks, startRtpForwarderProcess } from '../../../../webrtc/src/rtp-forwarders';
 import { AudioStreamingCodecType, SRTPCryptoSuites } from '../../hap';
+import { getDebugMode } from './camera-debug-mode-storage';
 import { CameraStreamingSession, waitForFirstVideoRtcp } from './camera-streaming-session';
 import { createCameraStreamSender } from './camera-streaming-srtp-sender';
 import { checkCompatibleCodec, transcodingDebugModeWarning } from './camera-utils';
@@ -31,14 +32,14 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
     const videoArgs = ffmpegInput.h264FilterArguments?.slice() || [];
     const audioArgs: string[] = [];
 
-    const transcodingDebugMode = storage.getItem('transcodingDebugMode') === 'true';
-    if (transcodingDebugMode)
+    const debugMode = getDebugMode(storage);
+    if (debugMode.audio || debugMode.video)
         transcodingDebugModeWarning();
 
     const videoCodec = ffmpegInput.mediaStreamOptions?.video?.codec;
     const transcodeStreaming = !!ffmpegInput.h264EncoderArguments?.length
         || !!ffmpegInput.h264FilterArguments?.length;
-    const needsFFmpeg = transcodingDebugMode
+    const needsFFmpeg = debugMode.video
         || transcodeStreaming
         || ffmpegInput.container !== 'rtsp';
 
@@ -46,8 +47,8 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
         videoArgs.push("-bsf:v", "dump_extra");
 
     // encoder args
-    if (transcodingDebugMode || transcodeStreaming) {
-        if (transcodingDebugMode || !ffmpegInput.h264EncoderArguments) {
+    if (debugMode.video || transcodeStreaming) {
+        if (debugMode.video || !ffmpegInput.h264EncoderArguments) {
             videoArgs.push(...getDebugModeH264EncoderArgs());
         }
         else {
@@ -204,7 +205,7 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
         }
 
         audio = {
-            codecCopy: !transcodingDebugMode && requestedOpus ? 'opus' : 'transcode',
+            codecCopy: !debugMode.audio && requestedOpus ? 'opus' : 'transcode',
             encoderArguments: audioArgs,
             ffmpegDestination,
             packetSize: audiomtu,
@@ -222,12 +223,6 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
     }
     else {
         console.warn(device.name, 'homekit requested unknown audio codec, audio will not be streamed.', request);
-    }
-
-
-    if (session.killed) {
-        console.log('session ended before streaming could start. bailing.');
-        return;
     }
 
     // 11/15/2022
@@ -251,6 +246,11 @@ export async function startCameraStreamFfmpeg(device: ScryptedDevice & VideoCame
     // ntp timestamp algorithm. aac-eld is deprecated in any case.
 
     await waitForFirstVideoRtcp(console, session);
+
+    if (session.killed) {
+        console.log('session ended before streaming could start. bailing.');
+        return;
+    }
 
     const videoOptions = {
         maxPacketSize: videomtu,

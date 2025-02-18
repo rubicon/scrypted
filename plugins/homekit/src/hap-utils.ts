@@ -8,34 +8,6 @@ import { Categories, EventedHTTPServer, HAPStorage } from './hap';
 import { randomPinCode } from './pincode';
 import './types';
 
-class HAPLocalStorage {
-    initSync() {
-
-    }
-    getItem(key: string): any {
-        const data = localStorage.getItem(key);
-        if (!data)
-            return;
-        return JSON.parse(data);
-    }
-    setItemSync(key: string, value: any) {
-        localStorage.setItem(key, JSON.stringify(value));
-    }
-    removeItemSync(key: string) {
-        localStorage.removeItem(key);
-    }
-
-    persistSync() {
-
-    }
-}
-
-// HAP storage seems to be global?
-export function initializeHapStorage() {
-    HAPStorage.setStorage(new HAPLocalStorage());
-}
-
-
 export function createHAPUUID() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
         var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
@@ -76,6 +48,8 @@ export function typeToCategory(type: ScryptedDeviceType): Categories {
             return Categories.SENSOR;
         case ScryptedDeviceType.Switch:
             return Categories.SWITCH;
+        case ScryptedDeviceType.Siren:
+            return Categories.SWITCH;
         case ScryptedDeviceType.Thermostat:
             return Categories.THERMOSTAT;
         case ScryptedDeviceType.Vacuum:
@@ -92,7 +66,7 @@ export function createHAPUsername() {
 }
 
 export function getAddresses() {
-    const addresses = Object.entries(os.networkInterfaces()).filter(([iface]) => iface.startsWith('en') || iface.startsWith('eth') || iface.startsWith('wlan')).map(([_, addr]) => addr).flat().map(info => info.address).filter(address => address);
+    const addresses = Object.entries(os.networkInterfaces()).filter(([iface]) => iface.startsWith('en') || iface.startsWith('eth') || iface.startsWith('wlan') || iface.startsWith('net')).map(([_, addr]) => addr).flat().map(info => info.address).filter(address => address);
     return addresses;
 }
 
@@ -100,39 +74,50 @@ export function getRandomPort() {
     return Math.round(30000 + Math.random() * 20000);
 }
 
-export function createHAPUsernameStorageSettingsDict(device: { storage: Storage, name?: string }, group: string, networkGroup = group): StorageSettingsDict<'mac' | 'qrCode' | 'pincode' | 'portOverride' | 'resetAccessory'> {
+export function createHAPUsernameStorageSettingsDict(device: { storage: Storage, name?: string }, group: string, subgroup?: string): StorageSettingsDict<'mac' | 'addIdentifyingMaterial' | 'qrCode' | 'pincode' | 'portOverride' | 'resetAccessory'> {
     const alertReload = () => {
-        sdk.log.a(`You must reload the HomeKit plugin for the changes to ${device.name} to take effect.`);
+        sdk.log.a(`The HomeKit plugin will reload momentarily for the changes to ${device.name} to take effect.`);
+        sdk.deviceManager.requestRestart();
     }
 
     return {
+        addIdentifyingMaterial: {
+            hide: true,
+            type: 'boolean',
+        },
         qrCode: {
             group,
+            // subgroup,
             title: "Pairing QR Code",
-            type: 'qrcode',
+            type: 'html',
             readonly: true,
             description: "Scan with your iOS camera to pair this Scrypted with HomeKit.",
         },
         portOverride: {
-            group: networkGroup,
+            group,
+            subgroup,
             title: 'Bridge Port',
             persistedDefaultValue: getRandomPort(),
             description: 'Optional: The TCP port used by the Scrypted bridge. If none is specified, a random port will be chosen.',
             type: 'number',
-        },        pincode: {
+        },
+        pincode: {
             group,
+            // subgroup,
             title: "Manual Pairing Code",
             persistedDefaultValue: randomPinCode(),
             readonly: true,
         },
         mac: {
             group,
+            subgroup,
             hide: true,
             title: "Username Override",
             persistedDefaultValue: createHAPUsername(),
         },
         resetAccessory: {
             group,
+            subgroup,
             title: 'Reset Pairing',
             description: 'Resetting the pairing will resync it to HomeKit as a new device. Bridged devices will automatically relink as a new device. Accessory devices must be manually removed from the Home app and re-paired. Enter RESET to reset the pairing.',
             placeholder: 'RESET',

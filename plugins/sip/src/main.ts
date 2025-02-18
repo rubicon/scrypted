@@ -1,12 +1,12 @@
 import { closeQuiet, createBindZero, listenZero } from '@scrypted/common/src/listen-cluster';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
-import sdk, { BinarySensor, Camera, Device, DeviceProvider, DeviceCreator, DeviceCreatorSettings, FFmpegInput, Intercom, MediaObject, MediaStreamUrl, PictureOptions, RequestMediaStreamOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
+import sdk, { BinarySensor, Camera, DeviceProvider, DeviceCreator, DeviceCreatorSettings, FFmpegInput, Intercom, MediaObject, PictureOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera } from '@scrypted/sdk';
 import child_process, { ChildProcess } from 'child_process';
 import { ffmpegLogInitialOutput, safePrintFFmpegArguments } from "@scrypted/common/src/media-helpers";
 import dgram from 'dgram';
 import net from 'net';
-import { SipSession } from './sip-session';
-import { SipOptions } from './sip-call';
+import { SipCallSession } from './sip-call-session';
+import { SipOptions } from './sip-manager';
 import { RtpDescription, isStunMessage, getPayloadType, getSequenceNumber, isRtpMessagePayloadType } from './rtp-utils';
 import { randomBytes } from "crypto";
 
@@ -14,7 +14,7 @@ const { deviceManager, mediaManager } = sdk;
 
 class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, Settings, BinarySensor {
     buttonTimeout: NodeJS.Timeout;
-    session: SipSession;
+    callSession: SipCallSession;
     remoteRtpDescription: RtpDescription;
     audioOutForwarder: dgram.Socket;
     audioOutProcess: ChildProcess;
@@ -59,7 +59,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         else if (key === 'defaultStream') {
             const vsos = await this.getVideoStreamOptions();
             const stream = vsos.find(vso => vso.name === value);
-            this.storage.setItem('defaultStream', stream?.id);
+            this.storage.setItem('defaultStream', stream?.id || '');
         }
         else {
             this.storage.setItem(key, value.toString());
@@ -107,7 +107,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
 
         await this.callDoorbell();
 
-        if (!this.session)
+        if (!this.callSession)
             throw new Error("not in call");
 
         this.stopAudioOut();
@@ -118,7 +118,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         const audioOutForwarder = await createBindZero();
         this.audioOutForwarder = audioOutForwarder.server;
         audioOutForwarder.server.on('message', message => {
-            this.session.audioSplitter.send(message, remoteRtpDescription.audio.port, remoteRtpDescription.address);
+            this.callSession.audioSplitter.send(message, remoteRtpDescription.audio.port, remoteRtpDescription.address);
             return null;
         });
 
@@ -136,7 +136,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
         const cp = child_process.spawn(await mediaManager.getFFmpegPath(), args);
         this.audioOutProcess = cp;
         cp.on('exit', () => this.console.log('two way audio ended'));
-        this.session.onCallEnded.subscribe(() => {
+        this.callSession.onCallEnded.subscribe(() => {
             closeQuiet(audioOutForwarder.server);
             cp.kill('SIGKILL');
         });
@@ -157,19 +157,19 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
     stopSession() {
         this.doorbellAudioActive = false;
         this.audioInProcess?.kill('SIGKILL');
-        if (this.session) {
+        if (this.callSession) {
             this.console.log('ending sip session');
-            this.session.stop();
-            this.session = undefined;
+            this.callSession.stop();
+            this.callSession = undefined;
         }
     }
 
     async callDoorbell(): Promise<void> {
-        let sip: SipSession;
+        let sip: SipCallSession;
 
         const cleanup = () => {
-            if (this.session === sip)
-                this.session = undefined;
+            if (this.callSession === sip)
+                this.callSession = undefined;
             try {
                 this.console.log('stopping sip session.');
                 sip.stop();
@@ -193,12 +193,20 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
 
         let sipOptions: SipOptions = { from: "sip:" + from, to: "sip:" + to, localIp, localPort };
 
-        sip = await SipSession.createSipSession(this.console, this.name, sipOptions);
+        sip = await SipCallSession.createCallSession(this.console, this.name, sipOptions);
         sip.onCallEnded.subscribe(cleanup);
-        this.remoteRtpDescription = await sip.start();
+        this.remoteRtpDescription = await sip.call(
+            ( audio ) => {
+                return [
+                    `m=audio ${audio.port} RTP/AVP 0`,
+                    'a=rtpmap:0 PCMU/8000',
+                    'a=sendrecv'
+                ]
+            }
+        );
         this.console.log('SIP: Received remote SDP:\n', this.remoteRtpDescription.sdp)
 
-        let [rtpPort, rtcpPort] = await SipSession.reserveRtpRtcpPorts()
+        let [rtpPort, rtcpPort] = await SipCallSession.reserveRtpRtcpPorts()
         this.console.log(`Reserved RTP port ${rtpPort} and RTCP port ${rtcpPort} for incoming SIP audio`);
 
         const ffmpegPath = await mediaManager.getFFmpegPath();
@@ -252,7 +260,7 @@ class SipCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCam
             sip.audioRtcpSplitter.send(message, rtcpPort, "127.0.0.1");
         });
 
-        this.session = sip;
+        this.callSession = sip;
     }
 
     getRawVideoStreamOptions(): ResponseMediaStreamOptions[] {
@@ -422,12 +430,16 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
 
     constructor(nativeId?: string) {
         super(nativeId);
-
+        this.systemDevice = {
+            deviceCreator: 'SIP Camera',
+        };
         for (const camId of deviceManager.getNativeIds()) {
             if (camId)
                 this.getDevice(camId);
         }
     }
+
+    
 
     async createDevice(settings: DeviceCreatorSettings): Promise<string> {
         const nativeId = randomBytes(4).toString('hex');
@@ -470,6 +482,12 @@ export class SipCamProvider extends ScryptedDeviceBase implements DeviceProvider
         }
         return ret;
     }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+        if( this.devices.delete( nativeId ) ) {
+            this.console.log("Removed device from list: " + id + " / " + nativeId )   
+        }
+    }    
 
     createCamera(nativeId: string): SipCamera {
         return new SipCamera(nativeId, this);

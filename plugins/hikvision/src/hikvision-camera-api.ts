@@ -1,16 +1,28 @@
-import AxiosDigestAuth from '@koush/axios-digest-auth';
+import { AuthFetchCredentialState, HttpFetchOptions, authHttpFetch } from '@scrypted/common/src/http-auth-fetch';
+import { readLine } from '@scrypted/common/src/read-stream';
+import { parseHeaders, readBody, readMessage } from '@scrypted/common/src/rtsp-server';
+import { MediaStreamConfiguration, MediaStreamOptions } from "@scrypted/sdk";
+import contentType from 'content-type';
 import { IncomingMessage } from 'http';
-import https from 'https';
+import { EventEmitter, Readable } from 'stream';
+import xml2js from 'xml2js';
+import { Destroyable } from '../../rtsp/src/rtsp';
+import { CapabiltiesResponse } from './hikvision-api-capabilities';
+import { HikvisionAPI, HikvisionCameraStreamSetup } from "./hikvision-api-channels";
+import { AlarmTriggerConfig, ChannelResponse, ChannelsResponse, SupplementLightRoot } from './hikvision-xml-types';
+import { getDeviceInfo } from './probe';
+import { TextOverlayRoot, VideoOverlayRoot } from './hikvision-overlay';
 
-export const hikvisionHttpsAgent = new https.Agent({
-    rejectUnauthorized: false,
-});
+export const detectionMap = {
+    human: 'person',
+    vehicle: 'car',
+}
 
 export function getChannel(channel: string) {
     return channel || '101';
 }
 
-export enum HikVisionCameraEvent {
+export enum HikvisionCameraEvent {
     MotionDetected = "<eventType>VMD</eventType>",
     VideoLoss = "<eventType>videoloss</eventType>",
     // <eventType>linedetection</eventType>
@@ -18,6 +30,8 @@ export enum HikVisionCameraEvent {
     // <eventType>linedetection</eventType>
     // <eventState>inactive</eventState>
     LineDetection = "<eventType>linedetection</eventType>",
+    RegionEntrance = "<eventType>regionEntrance</eventType>",
+    RegionExit = "<eventType>regionExit</eventType>",
     // <eventType>fielddetection</eventType>
     // <eventState>active</eventState>
     // <eventType>fielddetection</eventType>
@@ -25,126 +39,851 @@ export enum HikVisionCameraEvent {
     FieldDetection = "<eventType>fielddetection</eventType>",
 }
 
-
-export interface HikVisionCameraStreamSetup {
-    videoCodecType: string;
-    audioCodecType: string;
+// convert thees to ffmpeg codecs
+// G.722.1,G.711ulaw,G.711alaw,MP2L2,G.726,PCM,MP3
+function fromHikvisionAudioCodec(codec: string) {
+    if (codec === 'G.711ulaw')
+        return 'pcm_mulaw';
+    if (codec === 'G.711alaw')
+        return 'pcm_alaw';
+    if (codec === 'MP3')
+        return 'mp3';
 }
 
-export class HikVisionCameraAPI {
-    digestAuth: AxiosDigestAuth;
+function toHikvisionAudioCodec(codec: string) {
+    if (codec === 'pcm_mulaw')
+        return 'G.711ulaw';
+    if (codec === 'pcm_alaw')
+        return 'G.711alaw';
+    if (codec === 'mp3')
+        return 'MP3';
+}
+
+export class HikvisionCameraAPI implements HikvisionAPI {
+    credential: AuthFetchCredentialState;
     deviceModel: Promise<string>;
-    listenerPromise: Promise<IncomingMessage>;
+    listenerPromise: Promise<Destroyable>;
 
     constructor(public ip: string, username: string, password: string, public console: Console) {
-        this.digestAuth = new AxiosDigestAuth({
+        this.credential = {
             username,
             password,
+        };
+    }
+
+    async request(urlOrOptions: string | URL | HttpFetchOptions<Readable>, body?: Readable) {
+        const response = await authHttpFetch({
+            ...typeof urlOrOptions !== 'string' && !(urlOrOptions instanceof URL) ? urlOrOptions : {
+                url: urlOrOptions,
+            },
+            rejectUnauthorized: false,
+            credential: this.credential,
+            body: typeof urlOrOptions !== 'string' && !(urlOrOptions instanceof URL) ? urlOrOptions?.body : body,
         });
+        return response;
+    }
+
+    async reboot() {
+        const response = await this.request({
+            url: `http://${this.ip}/ISAPI/System/reboot`,
+            method: "PUT",
+            responseType: 'text',
+        });
+
+        return response.body;
+    }
+
+    async getDeviceInfo() {
+        return getDeviceInfo(this.credential, this.ip);
+    }
+
+    async checkTwoWayAudio() {
+        const response = await this.request({
+            url: `http://${this.ip}/ISAPI/System/TwoWayAudio/channels`,
+            responseType: 'text',
+        });
+
+        return response.body.includes('Speaker');
     }
 
     async checkDeviceModel(): Promise<string> {
         if (!this.deviceModel) {
-            this.deviceModel = new Promise(async (resolve, reject) => {
-                try {
-                    const response = await this.digestAuth.request({
-                        httpsAgent: hikvisionHttpsAgent,
-                        method: "GET",
-                        responseType: 'text',
-                        url: `http://${this.ip}/ISAPI/System/deviceInfo`,
-                    });
-                    const deviceModel = response.data.match(/>(.*?)<\/model>/)?.[1];
-                    resolve(deviceModel);
-                } catch (e) {
-                    this.console.error('error checking NVR model', e);
-                    resolve(undefined);
-                }
+            this.deviceModel = this.getDeviceInfo().then(d => d.deviceModel).catch(e => {
+                this.console.error('error checking NVR model', e);
+                return undefined;
             });
         }
         return await this.deviceModel;
     }
 
     async checkIsOldModel() {
-        // The old Hikvision DS-7608NI-E2 doesn't support channel capability checks, and the requests cause errors
+        // The old Hikvision NVRs don't support channel capability checks, and the requests cause errors
+        const oldModels = [
+            /DS-76098NI-E2/,
+            /ERI-K104-P4/
+        ];
         const model = await this.checkDeviceModel();
         if (!model)
             return;
-        return !!model?.match(/DS-7608NI-E2/);
+        return !!oldModels.find(oldModel => model?.match(oldModel));
     }
 
-    async checkStreamSetup(channel: string, isOld: boolean): Promise<HikVisionCameraStreamSetup> {
-        if (isOld) {
-            this.console.error('NVR is old version.  Defaulting camera capabilities to H.264/AAC');
-            return {
-                videoCodecType: "H.264",
-                audioCodecType: "AAC",
-            }
-        }
-
-        const response = await this.digestAuth.request({
-            httpsAgent: hikvisionHttpsAgent,
-            method: "GET",
-            responseType: 'text',
-            url: `http://${this.ip}/ISAPI/Streaming/channels/${getChannel(channel)}/capabilities`,
-        });
-
-        // this is bad:
-        // <videoCodecType opt="H.264,H.265">H.265</videoCodecType>
-        const vcodec = response.data.match(/>(.*?)<\/videoCodecType>/);
-        const acodec = response.data.match(/>(.*?)<\/audioCompressionType>/);
-
-        return {
-            videoCodecType: vcodec?.[1],
-            audioCodecType: acodec?.[1],
-        }
-    }
-
-    async jpegSnapshot(channel: string): Promise<Buffer> {
+    async jpegSnapshot(channel: string, timeout = 10000): Promise<Buffer> {
         const url = `http://${this.ip}/ISAPI/Streaming/channels/${getChannel(channel)}/picture?snapShotImageType=JPEG`
 
-        const response = await this.digestAuth.request({
-            httpsAgent: hikvisionHttpsAgent,
-            method: "GET",
-            responseType: 'arraybuffer',
+        const response = await this.request({
             url: url,
+            timeout,
         });
 
-        return Buffer.from(response.data);
+        return response.body;
     }
 
-    async listenEvents() {
+    async getVcaResource(channel: string) {
+        const response = await this.request({
+            url: `http://${this.ip}/ISAPI/System/Video/inputs/channels/${getChannel(channel)}/VCAResource`,
+            responseType: 'text',
+        });
+
+        return response.body as string;
+    }
+
+    async putVcaResource(channel: string, resource: 'smart' | 'facesnap' | 'close') {
+        const current = await this.getVcaResource(channel);
+        // no op
+        if (current.includes(resource))
+            return true;
+
+        const xml = '<?xml version="1.0" encoding="UTF-8"?>\r\n' +
+            '<VCAResource version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">\r\n' +
+            `<type>${resource}</type>\r\n` +
+            '</VCAResource>\r\n';
+
+        const response = await this.request({
+            body: xml,
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/System/Video/inputs/channels/${getChannel(channel)}/VCAResource`,
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/xml',
+            },
+        });
+
+        // need to reboot after this change.
+        await this.reboot();
+        // return false to indicate that the change will take effect after the reboot.
+        return false;
+    }
+
+    async listenEvents(): Promise<Destroyable> {
+        const events = new EventEmitter();
+        (events as any).destroy = () => { };
         // support multiple cameras listening to a single single stream 
         if (!this.listenerPromise) {
             const url = `http://${this.ip}/ISAPI/Event/notification/alertStream`;
 
-            this.listenerPromise = this.digestAuth.request({
-                httpsAgent: hikvisionHttpsAgent,
-                method: "GET",
+
+            let lastSmartDetection: string;
+
+            this.listenerPromise = this.request({
                 url,
-                responseType: 'stream',
+                responseType: 'readable',
             }).then(response => {
-                const stream = response.data as IncomingMessage;
+                const stream: IncomingMessage = response.body;
+                (events as any).destroy = () => {
+                    stream.destroy();
+                    events.removeAllListeners();
+                };
+                stream.on('close', () => {
+                    this.listenerPromise = undefined;
+                    events.emit('close');
+                });
+                stream.on('end', () => {
+                    this.listenerPromise = undefined;
+                    events.emit('end');
+                });
+                stream.on('error', e => {
+                    this.listenerPromise = undefined;
+                    events.emit('error', e);
+                });
                 stream.socket.setKeepAlive(true);
 
-                stream.on('data', (buffer: Buffer) => {
-                    const data = buffer.toString();
-                    for (const event of Object.values(HikVisionCameraEvent)) {
-                        if (data.indexOf(event) !== -1) {
-                            const cameraNumber = data.match(/<channelID>(.*?)</)?.[1] || data.match(/<dynChannelID>(.*?)</)?.[1];
-                            const inactive = data.indexOf('<eventState>inactive</eventState>') !== -1;
-                            stream.emit('event', event, cameraNumber, inactive, data);
+                const ct = stream.headers['content-type'];
+                // make content type parsable as content disposition filename
+                const cd = contentType.parse(ct);
+                let { boundary } = cd.parameters;
+                boundary = `--${boundary}`;
+                const boundaryEnd = `${boundary}--`;
+
+
+                (async () => {
+                    while (true) {
+                        let ignore = await readLine(stream);
+                        ignore = ignore.trim();
+                        if (!ignore)
+                            continue;
+                        if (ignore === boundaryEnd)
+                            continue;
+                        if (ignore !== boundary
+                            // older hikvision nvr send a boundary in the headers, but then use a totally different constant boundary value
+                            && ignore != "--boundary") {
+                            this.console.error('expected boundary but found', ignore);
+                            throw new Error('expected boundary');
+                        }
+
+                        const message = await readMessage(stream);
+                        events.emit('data', message);
+                        message.unshift('');
+                        const headers = parseHeaders(message);
+                        const body = await readBody(stream, headers);
+
+                        try {
+                            if (!headers['content-type'].includes('application/xml') && lastSmartDetection) {
+                                if (!headers['content-type']?.startsWith('image/jpeg')) {
+                                    continue;
+                                }
+                                events.emit('smart', lastSmartDetection, body);
+                                lastSmartDetection = undefined;
+                                continue;
+                            }
+
+                        }
+                        finally {
+                            // is it possible that smart detections are sent without images?
+                            // if so, flush this detection.
+                            if (lastSmartDetection) {
+                                events.emit('smart', lastSmartDetection);
+                            }
+                        }
+
+                        const data = body.toString();
+                        events.emit('data', data);
+                        for (const event of Object.values(HikvisionCameraEvent)) {
+                            if (data.indexOf(event) !== -1) {
+                                const cameraNumber = data.match(/<channelID>(.*?)</)?.[1] || data.match(/<dynChannelID>(.*?)</)?.[1];
+                                const inactive = data.indexOf('<eventState>inactive</eventState>') !== -1;
+                                events.emit('event', event, cameraNumber, inactive, data);
+                                if (event === HikvisionCameraEvent.LineDetection
+                                    || event === HikvisionCameraEvent.RegionEntrance
+                                    || event === HikvisionCameraEvent.RegionExit
+                                    || event === HikvisionCameraEvent.FieldDetection) {
+                                    lastSmartDetection = data;
+                                }
+                            }
                         }
                     }
-                });
-                return stream;
+                })()
+                    .catch(() => stream.destroy());
+                return events as any as Destroyable;
             });
             this.listenerPromise.catch(() => this.listenerPromise = undefined);
-            this.listenerPromise.then(stream => {
-                stream.on('close', () => this.listenerPromise = undefined);
-                stream.on('end', () => this.listenerPromise = undefined);
-            });
         }
 
         return this.listenerPromise;
     }
+
+    async configureCodecs(camNumber: string, channelNumber: string, options: MediaStreamOptions): Promise<MediaStreamConfiguration> {
+        const cameraChannel = `${camNumber}${channelNumber}`;
+
+        const response = await this.request({
+            url: `http://${this.ip}/ISAPI/Streaming/channels/${cameraChannel}`,
+            responseType: 'text',
+        });
+        const channel: ChannelResponse = await xml2js.parseStringPromise(response.body);
+        const sc = channel.StreamingChannel;
+        const vc = sc.Video[0];
+        // may not be any audio
+        const ac = sc.Audio?.[0];
+
+        const { video: videoOptions, audio: audioOptions } = options;
+
+        if (videoOptions?.codec) {
+            let videoCodecType: string;
+            switch (videoOptions.codec) {
+                case 'h264':
+                    videoCodecType = 'H.264';
+                    break;
+                case 'h265':
+                    videoCodecType = 'H.265';
+                    break;
+            }
+            if (videoCodecType) {
+                vc.videoCodecType = [videoCodecType];
+                vc.SmartCodec = [{
+                    enabled: ['false'],
+                }];
+                vc.SVC = [{
+                    enabled: ['false'],
+                }];
+            }
+        }
+
+        if (videoOptions?.keyframeInterval)
+            vc.GovLength = [videoOptions.keyframeInterval.toString()];
+
+        if (videoOptions?.profile) {
+            let profile: string;
+            switch (videoOptions.profile) {
+                case 'baseline':
+                    profile = 'Baseline';
+                    break;
+                case 'main':
+                    profile = 'Main';
+                    break;
+                case 'high':
+                    profile = 'High';
+                    break;
+            }
+            if (profile) {
+                vc.H264Profile = [profile];
+                vc.H265Profile = [profile];
+            }
+        }
+
+        if (videoOptions?.width && videoOptions?.height) {
+            vc.videoResolutionWidth = [videoOptions?.width.toString()];
+            vc.videoResolutionHeight = [videoOptions?.height.toString()];
+        }
+
+
+        // can't be set by hikvision. But see if it is settable and doesn't match to direct user.
+        if (videoOptions?.bitrateControl && vc.videoQualityControlType?.[0]) {
+            const constant = videoOptions?.bitrateControl === 'constant';
+            if ((vc.videoQualityControlType[0] === 'CBR' && !constant) || (vc.videoQualityControlType[0] === 'VBR' && constant))
+                throw new Error(options.id + ': The camera video Bitrate Type must be manually set to ' + videoOptions?.bitrateControl + ' in the camera web admin.');
+        }
+
+        if (videoOptions?.bitrateControl) {
+            if (videoOptions?.bitrateControl === 'constant')
+                vc.videoQualityControlType = ['CBR'];
+            else if (videoOptions?.bitrateControl === 'variable')
+                vc.videoQualityControlType = ['VBR'];
+        }
+
+        if (videoOptions?.bitrate) {
+            const br = Math.round(videoOptions?.bitrate / 1000);
+            vc.vbrUpperCap = [br.toString()];
+            vc.constantBitRate = [br.toString()];
+        }
+
+        if (videoOptions?.fps) {
+            // fps is scaled by 100.
+            const fps = videoOptions.fps * 100;
+            vc.maxFrameRate = [fps.toString()];
+            // not sure if this is necessary.
+            const gov = parseInt(vc.GovLength[0]);
+            vc.keyFrameInterval = [(gov / videoOptions.fps * 100).toString()];
+        }
+
+        if (audioOptions?.codec && ac) {
+            ac.audioCompressionType = [toHikvisionAudioCodec(options.audio.codec)];
+            ac.enabled = ['true'];
+        }
+
+        const builder = new xml2js.Builder();
+        const put = builder.buildObject(sc);
+
+        const putChannelsResponse = await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/Streaming/channels/${cameraChannel}`,
+            responseType: 'text',
+            body: put,
+            headers: {
+                'Content-Type': 'application/xml',
+            }
+        });
+        this.console.log(putChannelsResponse.body);
+
+        const capsResponse = await this.request({
+            url: `http://${this.ip}/ISAPI/Streaming/channels/${cameraChannel}/capabilities`,
+            responseType: 'text',
+        });
+        this.console.log(capsResponse.body);
+
+        const capabilities: CapabiltiesResponse = await xml2js.parseStringPromise(capsResponse.body);
+        const v = capabilities.StreamingChannel.Video[0];
+        const vso: MediaStreamConfiguration = {
+            id: options.id,
+            video: {},
+        }
+        vso.video.bitrateRange = [parseInt(v.vbrUpperCap[0].$.min) * 1000, parseInt(v.vbrUpperCap[0].$.max) * 1000];
+        // fps is scaled by 100.
+        const fpsRange = v.maxFrameRate[0].$.opt.split(',').map(fps => parseInt(fps) / 100);
+        vso.video.fpsRange = [Math.min(...fpsRange), Math.max(...fpsRange)];
+
+        vso.video.bitrateControls = ['constant', 'variable'];
+        vso.video.keyframeIntervalRange = [parseInt(v.GovLength[0].$.min), parseInt(v.GovLength[0].$.max)];
+        const videoResolutionWidths = v.videoResolutionWidth[0].$.opt.split(',').map(w => parseInt(w));
+        const videoResolutionHeights = v.videoResolutionHeight[0].$.opt.split(',').map(h => parseInt(h));
+        vso.video.resolutions = videoResolutionWidths.map((w, i) => ([w, videoResolutionHeights[i]]));
+
+        return vso;
+    }
+
+    async getCodecs(camNumber: string) {
+        const defaultMap = new Map<string, MediaStreamOptions>();
+        defaultMap.set(camNumber + '01', undefined);
+        defaultMap.set(camNumber + '02', undefined);
+
+        try {
+            const response = await this.request({
+                url: `http://${this.ip}/ISAPI/Streaming/channels`,
+                responseType: 'text',
+            });
+            const xml = response.body;
+            const parsedXml: ChannelsResponse = await xml2js.parseStringPromise(xml);
+
+            const vsos: MediaStreamOptions[] = [];
+            for (const streamingChannel of parsedXml.StreamingChannelList.StreamingChannel) {
+                const [id] = streamingChannel.id;
+                const width = parseInt(streamingChannel?.Video?.[0]?.videoResolutionWidth?.[0]) || undefined;
+                const height = parseInt(streamingChannel?.Video?.[0]?.videoResolutionHeight?.[0]) || undefined;
+                let codec = streamingChannel?.Video?.[0]?.videoCodecType?.[0] as string;
+                codec = codec?.toLowerCase()?.replaceAll('.', '');
+                const vso: MediaStreamOptions = {
+                    id,
+                    video: {
+                        width,
+                        height,
+                        codec,
+                    }
+                }
+                vsos.push(vso);
+            }
+
+            return vsos;
+        }
+        catch (e) {
+            this.console.error('error retrieving channel ids', e);
+            return [...defaultMap.values()];
+        }
+    }
+
+    async getOverlay() {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}/ISAPI/System/Video/inputs/channels/1/overlays`,
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/xml',
+            },
+        });
+        const json = await xml2js.parseStringPromise(response.body) as VideoOverlayRoot;
+
+        return { json, xml: response.body };
+    }
+
+    async getOverlayText(overlayId: string) {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}//ISAPI/System/Video/inputs/channels/1/overlays/text/${overlayId}`,
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/xml',
+            },
+        });
+        const json = await xml2js.parseStringPromise(response.body) as TextOverlayRoot;
+
+        return { json, xml: response.body };
+    }
+
+    async updateOverlayText(overlayId: string, entry: TextOverlayRoot) {
+        const builder = new xml2js.Builder();
+        const xml = builder.buildObject(entry);
+
+        await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}//ISAPI/System/Video/inputs/channels/1/overlays/text/${overlayId}`,
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/xml',
+            },
+            body: xml
+        });
+    }
+
+    async getSupplementLight(): Promise<{ json: SupplementLightRoot | any; xml: any }> {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}/ISAPI/Image/channels/1/supplementLight`,
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/xml',
+            },
+        });
+        const xml = response.body;
+        const json = await xml2js.parseStringPromise(xml);
+        if (json.ResponseStatus) {
+            return { json, xml };
+        }
+        return { json, xml };
+    }
+
+    async setSupplementLight(params: { on?: boolean, brightness?: number, mode?: 'auto' | 'manual' }): Promise<void> {
+        const { json } = await this.getSupplementLight();
+
+        if (json.ResponseStatus) {
+            throw new Error("Supplemental light is not supported on this device.");
+        }
+
+        const supp: any = json.SupplementLight;
+        if (!supp) {
+            throw new Error("Supplemental light configuration not available.");
+        }
+
+        if (params.on !== undefined) {
+            supp.supplementLightMode = [params.on ? "colorVuWhiteLight" : "close"];
+        }
+        if (params.mode) {
+            supp.mixedLightBrightnessRegulatMode = [params.mode];
+        } else if (params.on !== undefined) {
+            supp.mixedLightBrightnessRegulatMode = [params.on ? "manual" : "auto"];
+        }
+        if (params.brightness !== undefined) {
+            let brightness = params.brightness;
+            if (brightness < 0) brightness = 0;
+            if (brightness > 100) brightness = 100;
+            supp.whiteLightBrightness = [brightness.toString()];
+        }
+        if (params.on === false) {
+            supp.whiteLightBrightness = ["0"];
+        }
+
+        const builder = new xml2js.Builder();
+        const newXml = builder.buildObject(json);
+        await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/Image/channels/1/supplementLight`,
+            responseType: 'text',
+            headers: {
+                'Content-Type': 'application/xml',
+            },
+            body: newXml,
+        });
+    }
+    async getAudioAlarm(): Promise<{ json: any; xml: string }> {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}/ISAPI/Event/triggers/notifications/AudioAlarm?format=json`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/json' },
+        });
+    
+        const responseText = response.body;
+        let json: any;
+    
+        try {
+            json = JSON.parse(responseText);
+        } catch (error) {
+            throw new Error("Invalid JSON response from API");
+        }
+    
+        return { json, xml: responseText };
+    }
+
+    async getAudioAlarmCapabilities(): Promise<{ json: any; xml: string }> {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}/ISAPI/Event/triggers/notifications/AudioAlarm/capabilities?format=json`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        const responseText = response.body;
+        let json = {};
+
+        try {
+            json = JSON.parse(responseText);
+        } catch (error) {
+            console.error("Failed to parse JSON response for getAudioAlarmCapabilities:", error);
+        }
+
+        return { json, xml: responseText };
+    }
+    
+    async setAudioAlarm(audioID: string, audioVolume: string, alarmTimes: string): Promise<{ json: any; xml: string }> {
+        const { json } = await this.getAudioAlarm();
+        if (!json?.AudioAlarm) {
+            throw new Error("Audio alarm configuration not available.");
+        }
+    
+        json.AudioAlarm.TimeRangeList = Array.from({ length: 7 }, (_, week) => ({
+            week: week + 1,
+            TimeRange: [{ id: 1, beginTime: "00:00", endTime: "24:00" }]
+        }));
+    
+        json.AudioAlarm = {
+            ...json.AudioAlarm,
+            audioID: Number(audioID),
+            audioVolume: Number(audioVolume),
+            alarmTimes: Number(alarmTimes),
+            audioClass: "alertAudio",
+            alertAudioID: Number(audioID),
+            customAudioID: 1
+        };
+    
+        const newJsonPayload = JSON.stringify(json);
+    
+        const response = await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/Event/triggers/notifications/AudioAlarm?format=json`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/json' },
+            body: newJsonPayload
+        });
+    
+        return { json, xml: response.body };
+    }
+
+    async getAlarmTriggerConfig(): Promise<AlarmTriggerConfig & { current?: any }> {
+        const config: AlarmTriggerConfig & { current?: any } = {
+            audioAlarmSupported: false,
+            whiteLightAlarmSupported: false,
+            ioSupported: false,
+        };
+
+        let ioSupported = false;
+        try {
+            const ioResponse = await this.request({
+                url: `http://${this.ip}/ISAPI/System/IO/inputs/capabilities`,
+                responseType: 'text',
+            });
+            const ioXml = ioResponse.body;
+            const ioParsed = await xml2js.parseStringPromise(ioXml);
+            if (ioParsed && ioParsed.IOInputPortList && ioParsed.IOInputPortList.IOInputPort) {
+                ioSupported = true;
+                config.ioSupported = true;
+            }
+        } catch (err) {
+            this.console.warn('IO inputs capabilities not supported');
+            config.ioSupported = false;
+        }
+    
+        if (!ioSupported) {
+            if (typeof (this as any).storage !== 'undefined' && (this as any).storage.setItem) {
+                (this as any).storage.setItem('alarmTriggerConfig', JSON.stringify(config));
+            }
+            return config;
+        }
+    
+        try {
+            const triggersResponse = await this.request({
+                url: `http://${this.ip}/ISAPI/Event/triggersCap`,
+                responseType: 'text',
+            });
+            const triggersXml = triggersResponse.body;
+            const triggersParsed = await xml2js.parseStringPromise(triggersXml);
+            const cap = triggersParsed.EventTriggersCap;
+            if (cap) {
+                if (
+                    cap.isSupportAudioAction &&
+                    cap.isSupportAudioAction[0] &&
+                    cap.isSupportAudioAction[0].toLowerCase() === 'true'
+                ) {
+                    config.audioAlarmSupported = true;
+                }
+                if (
+                    cap.isSupportWhiteLightAction &&
+                    cap.isSupportWhiteLightAction[0] &&
+                    cap.isSupportWhiteLightAction[0].toLowerCase() === 'true'
+                ) {
+                    config.whiteLightAlarmSupported = true;
+                }
+            }
+        } catch (err) {
+            // this.console.error('Error fetching event triggers capabilities', err);
+        }
+    
+        try {
+            const currentResponse = await this.request({
+                url: `http://${this.ip}/ISAPI/Event/triggers/IO-1`,
+                responseType: 'text',
+            });
+            // this.console.log('Current IO trigger configuration:', currentResponse.body);
+            const currentXml = currentResponse.body;
+            const currentParsed = await xml2js.parseStringPromise(currentXml);
+            const eventTrigger = currentParsed.EventTrigger;
+    
+            let notifications: any[] = [];
+            if (
+                eventTrigger.EventTriggerNotificationList &&
+                eventTrigger.EventTriggerNotificationList[0] &&
+                eventTrigger.EventTriggerNotificationList[0].EventTriggerNotification
+            ) {
+                notifications = eventTrigger.EventTriggerNotificationList[0].EventTriggerNotification;
+            }
+    
+            let audioOn = false;
+            let whiteLightOn = false;
+    
+            notifications.forEach((notif: any) => {
+                const id = notif.id && notif.id[0];
+                if (id === 'beep') {
+                    audioOn = true;
+                }
+                if (id === 'whiteLight') {
+                    whiteLightOn = true;
+                }
+            });
+    
+            config.current = {
+                audioOn,
+                whiteLightOn,
+                raw: eventTrigger,
+            };
+        } catch (err) {
+            this.console.error('Error fetching current IO trigger configuration', err);
+        }
+    
+        if (typeof (this as any).storage !== 'undefined' && (this as any).storage.setItem) {
+            (this as any).storage.setItem('alarmTriggerConfig', JSON.stringify(config));
+        }
+    
+        return config;
+    }    
+    
+    async setAlarmTriggerConfig(alarmTriggerItems: string[]): Promise<{ json: any; xml: string }> {
+        const selectedItems = alarmTriggerItems || [];
+    
+        let notifications = [];
+        if (selectedItems.includes('audioAlarm')) {
+            notifications.push({ id: "beep", notificationMethod: "beep", notificationRecurrence: "beginning" });
+            notifications.push({ id: "center", notificationMethod: "center", notificationRecurrence: "beginning" });
+        }
+        if (selectedItems.includes('whiteLight')) {
+            notifications.push({
+                id: "whiteLight",
+                notificationMethod: "whiteLight",
+                notificationRecurrence: "beginning",
+                WhiteLightAction: { whiteLightDurationTime: "0" }
+            });
+        }
+    
+        const payload = {
+            EventTrigger: {
+                id: "IO-1",
+                eventType: "IO",
+                eventDescription: "IO Event trigger Information",
+                inputIOPortID: "1",
+                videoInputChannelID: "1",
+                dynVideoInputChannelID: "1",
+                EventTriggerNotificationList: {
+                    EventTriggerNotification: notifications
+                }
+            }
+        };
+    
+        const builder = new xml2js.Builder();
+        const newXml = builder.buildObject(payload);
+    
+        const response = await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/Event/triggers/IO-1`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/xml' },
+            body: newXml
+        });
+    
+        const respXml = response.body;
+        let respJson = {};
+    
+        try {
+            respJson = await xml2js.parseStringPromise(respXml);
+        } catch (error) {
+            this.console.error("Failed to parse XML response for setAlarmTriggerConfig:", error);
+        }
+    
+        return { json: respJson, xml: respXml };
+    }
+    
+    async setAlarm(isOn: boolean): Promise<{ json: any; xml: string }> {
+        const data = `<IOPortData>
+            <enabled>${isOn ? 'true' : 'false'}</enabled>
+            <triggering>${isOn ? 'low' : 'high'}</triggering>
+        </IOPortData>`;
+    
+        const response = await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/System/IO/inputs/1`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/xml' },
+            body: data
+        });
+    
+        const xml = response.body;
+        let json = {};
+    
+        try {
+            json = await xml2js.parseStringPromise(xml);
+        } catch (error) {
+            console.error("Failed to parse XML response for setAlarmInput:", error);
+        }
+    
+        return { json, xml };
+    }
+
+    async getWhiteLightAlarmCapabilities(): Promise<{ json: any; xml: string }> {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}/ISAPI/Event/triggers/notifications/whiteLightAlarm/capabilities?format=json`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/json' },
+        });
+    
+        const responseText = response.body;
+        let json = {};
+    
+        try {
+            json = JSON.parse(responseText);
+        } catch (error) {
+            console.error("Failed to parse JSON response for getWhiteLightAlarmCapabilities:", error);
+        }
+    
+        return { json, xml: responseText };
+    }
+
+    async getWhiteLightAlarm(): Promise<{ json: any; xml: string }> {
+        const response = await this.request({
+            method: 'GET',
+            url: `http://${this.ip}/ISAPI/Event/triggers/notifications/whiteLightAlarm?format=json`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/json' },
+        });
+    
+        const responseText = response.body;
+        let json = {};
+    
+        try {
+            json = JSON.parse(responseText);
+        } catch (error) {
+            console.error("Failed to parse JSON response for getWhiteLightAlarm:", error);
+        }
+    
+        return { json, xml: responseText };
+    }
+    
+    async setWhiteLightAlarm(params: { durationTime: number, frequency: string, TimeRangeList?: Array<{ week: number, TimeRange: Array<{ id: number, beginTime: string, endTime: string }> }> }): Promise<{ json: any; xml: string }> {
+        const config = {
+            WhiteLightAlarm: {
+                durationTime: params.durationTime,
+                frequency: params.frequency,
+                TimeRangeList: params.TimeRangeList ?? Array.from({ length: 7 }, (_, week) => ({
+                    week: week + 1,
+                    TimeRange: [{ id: 1, beginTime: "00:00", endTime: "24:00" }]
+                }))
+            }
+        };
+    
+        const newJsonPayload = JSON.stringify(config);
+    
+        const response = await this.request({
+            method: 'PUT',
+            url: `http://${this.ip}/ISAPI/Event/triggers/notifications/whiteLightAlarm?format=json`,
+            responseType: 'text',
+            headers: { 'Content-Type': 'application/json' },
+            body: newJsonPayload
+        });
+        return { json: config, xml: response.body };
+    }
+    
 }

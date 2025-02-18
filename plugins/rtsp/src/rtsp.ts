@@ -1,32 +1,26 @@
-import sdk, { Setting, MediaObject, ScryptedInterface, FFmpegInput, PictureOptions, SettingValue, MediaStreamOptions, ResponseMediaStreamOptions, ScryptedMimeTypes, MediaStreamUrl } from "@scrypted/sdk";
-import { EventEmitter } from "stream";
-import { CameraProviderBase, CameraBase, UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
+import { timeoutPromise } from '@scrypted/common/src/promise-utils';
+import sdk, { MediaObject, MediaStreamUrl, PictureOptions, RequestPictureOptions, ResponseMediaStreamOptions, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue } from "@scrypted/sdk";
 import url from 'url';
-import { timeoutFunction, timeoutPromise } from '@scrypted/common/src/promise-utils';
+import { CameraBase, CameraProviderBase, UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
 
 export { UrlMediaStreamOptions } from "../../ffmpeg-camera/src/common";
 
-const { mediaManager } = sdk;
+export function createRtspMediaStreamOptions(url: string, index: number): UrlMediaStreamOptions {
+    return {
+        id: `channel${index}`,
+        name: `Stream ${index + 1}`,
+        url,
+        container: 'rtsp',
+        video: {
+        },
+        audio: {
 
+        },
+    };
+}
 export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
-    takePictureThrottled(option?: PictureOptions): Promise<MediaObject> {
+    takePicture(option?: PictureOptions): Promise<MediaObject> {
         throw new Error("The RTSP Camera does not provide snapshots. Install the Snapshot Plugin if snapshots are available via an URL.");
-    }
-
-    createRtspMediaStreamOptions(url: string, index: number): UrlMediaStreamOptions {
-        return {
-            id: `channel${index}`,
-            name: `Stream ${index + 1}`,
-            url,
-            container: 'rtsp',
-            video: {
-            },
-            audio: this.isAudioDisabled() ? null : {},
-        };
-    }
-
-    getChannelFromMediaStreamOptionsId(id: string) {
-        return id.substring('channel'.length);
     }
 
     getRawVideoStreamOptions(): UrlMediaStreamOptions[] {
@@ -44,7 +38,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
         }
 
         // filter out empty strings.
-        const ret = urls.filter(url => !!url).map((url, index) => this.createRtspMediaStreamOptions(url, index));
+        const ret = urls.filter(url => !!url).map((url, index) => createRtspMediaStreamOptions(url, index));
 
         if (!ret.length)
             return;
@@ -74,6 +68,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
 
     createMediaStreamUrl(stringUrl: string, vso: ResponseMediaStreamOptions) {
         const ret: MediaStreamUrl = {
+            container: vso.container,
             url: stringUrl,
             mediaStreamOptions: vso,
         };
@@ -117,7 +112,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
 
         ret.push(
             {
-                group: 'Advanced',
+                subgroup: 'Advanced',
                 key: 'debug',
                 title: 'Debug Events',
                 description: "Log all events to the console. This will be very noisy and should not be left enabled.",
@@ -136,6 +131,7 @@ export class RtspCamera extends CameraBase<UrlMediaStreamOptions> {
 
     async putRtspUrls(urls: string[]) {
         this.storage.setItem('urls', JSON.stringify(urls.filter(url => !!url)));
+        this.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
 
     async putSettingBase(key: string, value: SettingValue) {
@@ -160,7 +156,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
-        this.listenLoop();
+        process.nextTick(() => this.listenLoop());
     }
 
     resetSensors(): void {
@@ -231,11 +227,11 @@ export abstract class RtspSmartCamera extends RtspCamera {
 
     async putSetting(key: string, value: SettingValue) {
         this.putSettingBase(key, value);
-        this.listener.then(l => l.emit('error', new Error("new settings")));
+        this.listener?.then(l => l.emit('error', new Error("new settings")));
     }
 
-    async takePictureThrottled(option?: PictureOptions) {
-        return this.takeSmartCameraPicture(option);;
+    async takePicture(options?: RequestPictureOptions) {
+        return this.takeSmartCameraPicture(options);
     }
 
     abstract takeSmartCameraPicture(options?: PictureOptions): Promise<MediaObject>;
@@ -262,7 +258,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
                 value: this.storage.getItem('ip'),
             },
             ...this.getHttpPortOverrideSettings(),
-            ...this.getRtspPortOverrideSettings(),
+            ...await this.getRtspPortOverrideSettings(),
         ];
 
         if (this.showRtspUrlOverride()) {
@@ -287,7 +283,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
         return [
             {
                 key: 'httpPort',
-                group: 'Advanced',
+                subgroup: 'Advanced',
                 title: 'HTTP Port Override',
                 placeholder: '80',
                 value: this.storage.getItem('httpPort'),
@@ -299,14 +295,14 @@ export abstract class RtspSmartCamera extends RtspCamera {
         return true;
     }
 
-    getRtspPortOverrideSettings(): Setting[] {
+    async getRtspPortOverrideSettings(): Promise<Setting[]> {
         if (!this.showRtspPortOverride()) {
             return [];
         }
         return [
             {
                 key: 'rtspPort',
-                group: 'Advanced',
+                subgroup: 'Advanced',
                 title: 'RTSP Port Override',
                 placeholder: '554',
                 value: this.storage.getItem('rtspPort'),
@@ -327,7 +323,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
     }
 
     setHttpPortOverride(port: string) {
-        this.storage.setItem('httpPort', port);
+        this.storage.setItem('httpPort', port || '');
     }
 
     getRtspUrlOverride() {
@@ -375,7 +371,7 @@ export abstract class RtspSmartCamera extends RtspCamera {
     }
 }
 
-export class RtspProvider extends CameraProviderBase<UrlMediaStreamOptions> {
+export abstract class RtspProvider extends CameraProviderBase<UrlMediaStreamOptions> {
     createCamera(nativeId: string): RtspCamera {
         return new RtspCamera(nativeId, this);
     }

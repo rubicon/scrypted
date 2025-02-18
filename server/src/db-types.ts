@@ -20,7 +20,7 @@ export class ScryptedUser extends ScryptedDocument {
     passwordHash: string;
     token: string;
     salt: string;
-    restricted: boolean;
+    aclId: string;
 }
 
 export class ScryptedAlert extends ScryptedDocument {
@@ -28,7 +28,7 @@ export class ScryptedAlert extends ScryptedDocument {
     title: string;
     path: string;
     message: string;
-}``
+}
 
 export class PluginDevice extends ScryptedDocument {
     constructor(id?: string) {

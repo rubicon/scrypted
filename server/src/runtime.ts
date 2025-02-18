@@ -1,47 +1,59 @@
-import { Device, DeviceInformation, EngineIOHandler, HttpRequest, HttpRequestHandler, OauthClient, PushHandler, ScryptedDevice, ScryptedInterface, ScryptedInterfaceProperty, ScryptedNativeId } from '@scrypted/types';
+import { Device, DeviceInformation, DeviceProvider, EngineIOHandler, HttpRequest, HttpRequestHandler, ScryptedDevice, ScryptedInterface, ScryptedInterfaceMethod, ScryptedInterfaceProperty, ScryptedNativeId, ScryptedUser as SU } from '@scrypted/types';
 import AdmZip from 'adm-zip';
-import axios from 'axios';
+import crypto from 'crypto';
 import * as io from 'engine.io';
 import { once } from 'events';
 import express, { Request, Response } from 'express';
+import { ParamsDictionary } from 'express-serve-static-core';
+import fs from 'fs';
 import http, { ServerResponse } from 'http';
 import https from 'https';
-import type { spawn as ptySpawn } from 'node-pty-prebuilt-multiarch';
+import net from 'net';
 import path from 'path';
-import rimraf from 'rimraf';
+import { ParsedQs } from 'qs';
 import semver from 'semver';
-import { PassThrough } from 'stream';
-import tar from 'tar';
+import { Parser as TarParser } from 'tar';
 import { URL } from "url";
 import WebSocket, { Server as WebSocketServer } from "ws";
-import { Plugin, PluginDevice, ScryptedAlert } from './db-types';
+import { computeClusterObjectHash } from './cluster/cluster-hash';
+import { ClusterObject } from './cluster/connect-rpc-object';
+import { Plugin, PluginDevice, ScryptedAlert, ScryptedUser } from './db-types';
+import { httpFetch } from './fetch/http-fetch';
 import { createResponseInterface } from './http-interfaces';
 import { getDisplayName, getDisplayRoom, getDisplayType, getProvidedNameOrDefault, getProvidedRoomOrDefault, getProvidedTypeOrDefault } from './infer-defaults';
 import { IOServer } from './io';
-import { Level } from './level';
+import Level from './level';
 import { LogEntry, Logger, makeAlertId } from './logger';
-import { hasMixinCycle } from './mixin/mixin-cycle';
+import { getMixins, hasMixinCycle } from './mixin/mixin-cycle';
+import { AccessControls } from './plugin/acl';
 import { PluginDebug } from './plugin/plugin-debug';
 import { PluginDeviceProxyHandler } from './plugin/plugin-device';
-import { PluginHost } from './plugin/plugin-host';
+import { PluginHost, UnsupportedRuntimeError } from './plugin/plugin-host';
 import { isConnectionUpgrade, PluginHttp } from './plugin/plugin-http';
 import { WebSocketConnection } from './plugin/plugin-remote-websocket';
 import { getPluginVolume } from './plugin/plugin-volume';
+import { getBuiltinRuntimeHosts } from './plugin/runtime/runtime-host';
 import { getIpAddress, SCRYPTED_INSECURE_PORT, SCRYPTED_SECURE_PORT } from './server-settings';
-import { AddressSettigns as AddressSettings } from './services/addresses';
+import { AddressSettings } from './services/addresses';
 import { Alerts } from './services/alerts';
-import { CORSControl, CORSServer } from './services/cors';
+import { Backup } from './services/backup';
+import { ClusterForkService } from './services/cluster-fork';
+import { CORSControl } from './services/cors';
 import { Info } from './services/info';
-import { PluginComponent } from './services/plugin';
+import { getNpmPackageInfo, PluginComponent } from './services/plugin';
 import { ServiceControl } from './services/service-control';
+import { UsersService } from './services/users';
 import { getState, ScryptedStateManager, setState } from './state';
+import { isClusterAddress } from './cluster/cluster-setup';
+import { RunningClusterWorker } from './scrypted-cluster-main';
+import { EnvControl } from './services/env';
 
 interface DeviceProxyPair {
     handler: PluginDeviceProxyHandler;
     proxy: ScryptedDevice;
 }
 
-const MIN_SCRYPTED_CORE_VERSION = 'v0.1.16';
+const MIN_SCRYPTED_CORE_VERSION = 'v0.2.6';
 const PLUGIN_DEVICE_STATE_VERSION = 2;
 
 interface HttpPluginData {
@@ -50,7 +62,10 @@ interface HttpPluginData {
 }
 
 export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
-    datastore: Level;
+    clusterId = crypto.randomBytes(3).toString('hex');
+    clusterSecret = process.env.SCRYPTED_CLUSTER_SECRET || crypto.randomBytes(16).toString('hex');
+    clusterWorkers = new Map<string, RunningClusterWorker>();
+    serverClusterWorkerId: string;
     plugins: { [id: string]: PluginHost } = {};
     pluginDevices: { [id: string]: PluginDevice } = {};
     devices: { [id: string]: DeviceProxyPair } = {};
@@ -59,7 +74,7 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
     devicesLogger = this.logger.getLogger('device', 'Devices');
     wss = new WebSocketServer({ noServer: true });
     wsAtomic = 0;
-    shellio: IOServer = new io.Server({
+    connectRPCObjectIO: IOServer = new io.Server({
         pingTimeout: 120000,
         perMessageDeflate: true,
         cors: (req, callback) => {
@@ -70,40 +85,69 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             })
         },
     });
-    cors: CORSServer[] = [];
     pluginComponent = new PluginComponent(this);
-    servieControl = new ServiceControl(this);
+    serviceControl = new ServiceControl();
     alerts = new Alerts(this);
     corsControl = new CORSControl(this);
     addressSettings = new AddressSettings(this);
+    usersService = new UsersService(this);
+    clusterFork = new ClusterForkService(this);
+    envControl = new EnvControl();
+    info = new Info();
+    backup = new Backup(this);
+    pluginHosts = getBuiltinRuntimeHosts();
 
-    constructor(datastore: Level, insecure: http.Server, secure: https.Server, app: express.Application) {
+    constructor(public mainFilename: string, public datastore: Level, insecure: http.Server, secure: https.Server, app: express.Application) {
         super(app);
-        this.datastore = datastore;
-        this.app = app;
+        // ensure that all the users are loaded from the db.
+        this.usersService.getAllUsers();
 
         app.disable('x-powered-by');
 
         this.addMiddleware();
 
-        app.get('/web/oauth/callback', (req, res) => {
-            this.oauthCallback(req, res);
-        });
+        app.all('/engine.io/connectRPCObject', (req, res) => this.connectRPCObjectHandler(req, res));
 
-        app.all('/engine.io/shell', (req, res) => {
-            this.shellHandler(req, res);
-        });
-
-        this.shellio.on('connection', connection => {
+        /*
+        * Handle incoming connections that will be
+        * proxied to a connectRPCObject socket.
+        *
+        * Note that the clusterObject hash must be
+        * verified before connecting to the target port.
+        */
+        this.connectRPCObjectIO.on('connection', connection => {
             try {
-                const spawn = require('node-pty-prebuilt-multiarch').spawn as typeof ptySpawn;
-                const cp = spawn(process.env.SHELL, [], {
+                const clusterObject: ClusterObject = JSON.parse((connection.request as Request).query.clusterObject as string);
+                const sha256 = computeClusterObjectHash(clusterObject, this.clusterSecret);
+                if (sha256 != clusterObject.sha256) {
+                    connection.send({
+                        error: 'invalid signature'
+                    });
+                    connection.close();
+                    return;
+                }
+
+                let address = clusterObject.address;
+                if (isClusterAddress(address))
+                    address = '127.0.0.1';
+                const socket = net.connect({
+                    port: clusterObject.port,
+                    host: address,
                 });
-                cp.onData(data => connection.send(data));
-                connection.on('message', message => cp.write(message.toString()));
-                connection.on('close', () => cp.kill());
-            }
-            catch (e) {
+                socket.on('error', () => connection.close());
+                socket.on('close', () => connection.close());
+                socket.on('data', data => connection.send(data));
+                connection.on('close', () => socket.destroy());
+                connection.on('message', message => {
+                    if (typeof message !== 'string') {
+                        socket.write(message);
+                    }
+                    else {
+                        console.warn('unexpected string data on engine.io rpc connection. terminating.')
+                        connection.close();
+                    }
+                });
+            } catch {
                 connection.close();
             }
         });
@@ -147,11 +191,25 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         }, 60 * 60 * 1000);
     }
 
+    checkUpgrade(req: express.Request<ParamsDictionary, any, any, ParsedQs, Record<string, any>>, res: express.Response<any, Record<string, any>>, pluginData: HttpPluginData): void {
+        // pluginData.pluginHost.io.
+        const { sid } = req.query;
+        const client = (pluginData.pluginHost.io as any).clients[sid as string];
+        if (client) {
+            res.locals.username = 'existing-io-session';
+        }
+    }
+
     addAccessControlHeaders(req: http.IncomingMessage, res: http.ServerResponse) {
         res.setHeader('Vary', 'Origin,Referer');
         const header = this.getAccessControlAllowOrigin(req.headers);
-        if (header)
+        if (header) {
             res.setHeader('Access-Control-Allow-Origin', header);
+        }
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+        res.setHeader('Access-Control-Allow-Private-Network', 'true');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Length, X-Requested-With, Access-Control-Request-Method');
     }
 
     getAccessControlAllowOrigin(headers: http.IncomingHttpHeaders) {
@@ -168,7 +226,7 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         if (!origin)
             return;
         const servers: string[] = process.env.SCRYPTED_ACCESS_CONTROL_ALLOW_ORIGINS?.split(',') || [];
-        servers.push(...Object.values(this.cors).map(entry => entry.server));
+        servers.push(...Object.values(this.corsControl.origins).flat());
         if (!servers.includes(origin))
             return;
 
@@ -176,57 +234,9 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
     }
 
     getDeviceLogger(device: PluginDevice): Logger {
+        if (!device)
+            return;
         return this.devicesLogger.getLogger(device._id, getState(device, ScryptedInterfaceProperty.name));
-    }
-
-    async oauthCallback(req: Request, res: Response) {
-        try {
-            const { callback_url } = req.query;
-            if (!callback_url) {
-                const html =
-                    "<head>\n" +
-                    "    <script>\n" +
-                    "        window.location = '/web/oauth/callback?callback_url=' + encodeURIComponent(window.location.toString());\n" +
-                    "    </script>\n" +
-                    "</head>\n" +
-                    "</head>\n" +
-                    "</html>"
-                res.send(html);
-                return;
-            }
-
-            const url = new URL(callback_url as string);
-            if (url.search) {
-                const state = url.searchParams.get('state');
-                if (state) {
-                    const { s, d, r } = JSON.parse(state);
-                    url.searchParams.set('state', s);
-                    const oauthClient: ScryptedDevice & OauthClient = this.getDevice(d);
-                    await oauthClient.onOauthCallback(url.toString()).catch();
-                    res.redirect(r);
-                    return;
-                }
-            }
-            if (url.hash) {
-                const hash = new URLSearchParams(url.hash.substring(1));
-                const state = hash.get('state');
-                if (state) {
-                    const { s, d, r } = JSON.parse(state);
-                    hash.set('state', s);
-                    url.hash = '#' + hash.toString();
-                    const oauthClient: ScryptedDevice & OauthClient = this.getDevice(d);
-                    await oauthClient.onOauthCallback(url.toString());
-                    res.redirect(r);
-                    return;
-                }
-            }
-
-            throw new Error('no state object found in query or hash');
-        }
-        catch (e) {
-            res.status(500);
-            res.send();
-        }
     }
 
     async getPluginForEndpoint(endpoint: string): Promise<HttpPluginData> {
@@ -251,22 +261,7 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         };
     }
 
-    async deliverPush(endpoint: string, request: HttpRequest) {
-        const { pluginHost, pluginDevice } = await this.getPluginForEndpoint(endpoint);
-        if (!pluginDevice) {
-            console.error('plugin device missing for', endpoint);
-            return;
-        }
-
-        if (!pluginDevice?.state.interfaces.value.includes(ScryptedInterface.PushHandler)) {
-            return;
-        }
-
-        const handler = this.getDevice<PushHandler>(pluginDevice._id);
-        return handler.onPush(request);
-    }
-
-    async shellHandler(req: Request, res: Response) {
+    async connectRPCObjectHandler(req: Request, res: Response) {
         const isUpgrade = isConnectionUpgrade(req.headers);
 
         const end = (code: number, message: string) => {
@@ -287,10 +282,11 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             return;
         }
 
+        const reqany = req as any;
         if ((req as any).upgradeHead)
-            this.shellio.handleUpgrade(req, res.socket, (req as any).upgradeHead)
+            this.connectRPCObjectIO.handleUpgrade(reqany, res.socket, reqany.upgradeHead)
         else
-            this.shellio.handleRequest(req, res);
+            this.connectRPCObjectIO.handleRequest(reqany, res);
     }
 
     async getEndpointPluginData(req: Request, endpoint: string, isUpgrade: boolean, isEngineIOEndpoint: boolean): Promise<HttpPluginData> {
@@ -345,7 +341,14 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         });
 
         // @ts-expect-error
-        await handler.onConnection(httpRequest, new WebSocketConnection(`ws://${id}`));
+        await handler.onConnection(httpRequest, new WebSocketConnection(`ws://${id}`, {
+            send(message) {
+                ws.send(message);
+            },
+            close(message) {
+                ws.close();
+            },
+        }));
     }
 
     async getComponent(componentId: string): Promise<any> {
@@ -357,11 +360,11 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             case 'SCRYPTED_SECURE_PORT':
                 return SCRYPTED_SECURE_PORT;
             case 'info':
-                return new Info();
+                return this.info;
             case 'plugins':
                 return this.pluginComponent;
             case 'service-control':
-                return this.servieControl;
+                return this.serviceControl;
             case 'logger':
                 return this.logger;
             case 'alerts':
@@ -370,6 +373,14 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
                 return this.corsControl;
             case 'addresses':
                 return this.addressSettings;
+            case "users":
+                return this.usersService;
+            case 'backup':
+                return this.backup;
+            case 'cluster-fork':
+                return this.clusterFork;
+            case 'env-control':
+                return this.envControl;
         }
     }
 
@@ -385,8 +396,36 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         return packageJson;
     }
 
-    handleEngineIOEndpoint(req: Request, res: ServerResponse, endpointRequest: HttpRequest, pluginData: HttpPluginData) {
+    async getAccessControls(username: string) {
+        if (!username)
+            return;
+
+        const user = await this.datastore.tryGet(ScryptedUser, username);
+        if (user?.aclId) {
+            const accessControl = this.getDevice<SU>(user.aclId);
+            const acls = await accessControl.getScryptedUserAccessControl();
+            if (!acls)
+                return;
+            return new AccessControls(acls);
+        }
+    }
+
+    async handleEngineIOEndpoint(req: Request, res: ServerResponse & { locals: any }, endpointRequest: HttpRequest, pluginData: HttpPluginData) {
         const { pluginHost, pluginDevice } = pluginData;
+
+        const { username } = res.locals;
+        let accessControls: AccessControls;
+
+        try {
+            accessControls = await this.getAccessControls(username);
+            if (accessControls?.shouldRejectMethod(pluginDevice._id, ScryptedInterfaceMethod.onConnection))
+                accessControls.deny();
+        }
+        catch (e) {
+            res.writeHead(401);
+            res.end();
+            return;
+        }
 
         if (!pluginHost || !pluginDevice) {
             console.error('plugin does not exist or is still starting up.');
@@ -395,14 +434,18 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             return;
         }
 
-        (req as any).scrypted = {
+        const reqany = req as any;
+
+        reqany.scrypted = {
             endpointRequest,
             pluginDevice,
+            accessControls,
         };
+
         if ((req as any).upgradeHead)
-            pluginHost.io.handleUpgrade(req, res.socket, (req as any).upgradeHead)
+            pluginHost.io.handleUpgrade(reqany, res.socket, reqany.upgradeHead)
         else
-            pluginHost.io.handleRequest(req, res);
+            pluginHost.io.handleRequest(reqany, res);
     }
 
     handleRequestEndpoint(req: Request, res: Response, endpointRequest: HttpRequest, pluginData: HttpPluginData) {
@@ -414,8 +457,19 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             });
         }
 
-        const filesPath = path.join(getPluginVolume(pluginHost.pluginId), 'files');
-        handler.onRequest(endpointRequest, createResponseInterface(res, pluginHost.unzippedPath, filesPath));
+        const { pluginId } = pluginHost;
+        const filesPath = path.join(getPluginVolume(pluginId), 'files');
+        const ri = createResponseInterface(this, res, pluginHost.unzippedPath, filesPath);
+        handler.onRequest(endpointRequest, ri)
+            .catch(() => { })
+            .finally(() => {
+                if (!ri.sent) {
+                    console.warn(pluginId, 'did not send a response before onRequest returned.');
+                    ri.send(`Internal Plugin Error: ${pluginId}`, {
+                        code: 500,
+                    })
+                }
+            });
     }
 
     killPlugin(pluginId: string) {
@@ -424,6 +478,7 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             delete this.plugins[pluginId];
             existing.kill();
         }
+        this.invalidatePluginMixins(pluginId);
     }
 
     // should this be async?
@@ -442,6 +497,11 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             return;
         proxyPair.handler.rebuildMixinTable();
         return proxyPair;
+    }
+
+    invalidatePluginMixins(pluginId: string) {
+        const deviceIds = new Set<string>(Object.values(this.pluginDevices).filter(d => d.pluginId === pluginId).map(d => d._id));
+        this.invalidateMixins(deviceIds);
     }
 
     invalidateMixins(ids: Set<string>) {
@@ -497,17 +557,25 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             return;
         installedSet.add(pkg);
 
-        const registry = (await axios(`https://registry.npmjs.org/${pkg}`)).data;
+        const registry = await getNpmPackageInfo(pkg);
         if (!version) {
             version = registry['dist-tags'].latest;
         }
         console.log('installing package', pkg, version);
 
-        const tarball = (await axios(`${registry.versions[version].dist.tarball}`, {
-            responseType: 'arraybuffer'
-        })).data;
+        const { body: tarball } = await httpFetch({
+            url: `${registry.versions[version].dist.tarball}`,
+            // force ipv4 in case of busted ipv6.
+            family: 4,
+        });
         console.log('downloaded tarball', tarball?.length);
-        const parse = new (tar.Parse as any)();
+        try {
+            const pp = new TarParser();
+        }
+        catch (e) {
+            throw new Error(e);
+        }
+        const parse = new TarParser();
         const files: { [name: string]: Buffer } = {};
 
         parse.on('entry', async (entry: any) => {
@@ -553,10 +621,8 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             return this.installPlugin(plugin);
         })();
 
-        const pt = new PassThrough();
-        pt.write(Buffer.from(tarball));
-        pt.push(null);
-        pt.pipe(parse);
+        parse.write(tarball);
+        parse.end();
         return ret;
     }
 
@@ -584,23 +650,30 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         return this.runPlugin(plugin, pluginDebug);
     }
 
-    setupPluginHostAutoRestart(pluginHost: PluginHost) {
-        pluginHost.worker.once('exit', () => {
-            if (pluginHost.killed)
+    setupPluginHostAutoRestart(pluginId: string, pluginHost?: PluginHost) {
+        const logger = this.getDeviceLogger(this.findPluginDevice(pluginId));
+
+        let timeout: NodeJS.Timeout;
+
+        const restart = () => {
+            if (timeout)
                 return;
-            pluginHost.kill();
-            const timeout = 60000;
-            console.error(`plugin unexpectedly exited, restarting in ${timeout}ms`, pluginHost.pluginId);
-            setTimeout(async () => {
-                const existing = this.plugins[pluginHost.pluginId];
-                if (existing !== pluginHost) {
-                    console.log('scheduled plugin restart cancelled, plugin was restarted by user', pluginHost.pluginId);
+
+            const t = 60000;
+            pluginHost?.kill();
+            logger.log('e', `plugin ${pluginId} unexpectedly exited, restarting in ${t}ms`);
+
+            timeout = setTimeout(async () => {
+                timeout = undefined;
+                const plugin = await this.datastore.tryGet(Plugin, pluginId);
+                if (!plugin) {
+                    logger.log('w', `scheduled plugin restart cancelled, plugin no longer exists ${pluginId}`);
                     return;
                 }
 
-                const plugin = await this.datastore.tryGet(Plugin, pluginHost.pluginId);
-                if (!plugin) {
-                    console.log('scheduled plugin restart cancelled, plugin no longer exists', pluginHost.pluginId);
+                const existing = this.plugins[pluginId];
+                if (existing && pluginHost && existing !== pluginHost && !existing.killed) {
+                    logger.log('w', `scheduled plugin restart cancelled, plugin was restarted by user ${pluginId}`);
                     return;
                 }
 
@@ -608,29 +681,86 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
                     this.runPlugin(plugin);
                 }
                 catch (e) {
-                    console.error('error restarting plugin', plugin._id, e);
+                    logger.log('e', `error restarting plugin ${pluginId}`);
+                    logger.log('e', e.toString());
+                    restart();
                 }
-            }, timeout);
-        });
+            }, t);
+        };
+        1
+        if (pluginHost) {
+            pluginHost.worker.once('error', restart);
+            pluginHost.worker.once('exit', restart);
+            pluginHost.worker.once('close', restart);
+        }
+        else {
+            restart();
+        }
+    }
+
+    loadPlugin(plugin: Plugin, pluginDebug?: PluginDebug) {
+        const pluginId = plugin._id;
+        try {
+            this.killPlugin(pluginId);
+
+            const pluginDevices = this.findPluginDevices(pluginId);
+            for (const pluginDevice of pluginDevices) {
+                this.invalidatePluginDevice(pluginDevice._id);
+            }
+
+            const pluginHost = new PluginHost(this, plugin, pluginDebug);
+            this.plugins[pluginId] = pluginHost;
+            this.setupPluginHostAutoRestart(pluginId, pluginHost);
+
+            return pluginHost;
+        }
+        catch (e) {
+            const logger = this.getDeviceLogger(this.findPluginDevice(pluginId));
+            if (e instanceof UnsupportedRuntimeError) {
+                logger.log('e', 'error loading plugin (not retrying)');
+                logger.log('e', e.toString());
+                throw e;
+            }
+
+            logger.log('e', 'error loading plugin (retrying...)');
+            logger.log('e', e.toString());
+            this.setupPluginHostAutoRestart(pluginId);
+            throw e;
+        }
+    }
+
+    probePluginDevices(plugin: Plugin) {
+        const pluginId = plugin._id;
+        const pluginDevices = this.findPluginDevices(pluginId);
+
+        const pluginDeviceSet = new Set<string>();
+        for (const pluginDevice of pluginDevices) {
+            if (pluginDeviceSet.has(pluginDevice._id))
+                continue;
+            pluginDeviceSet.add(pluginDevice._id);
+            this.getDevice(pluginDevice._id)?.probe().catch(() => { });
+        }
+
+        for (const pluginDevice of Object.values(this.pluginDevices)) {
+            const { _id } = pluginDevice;
+            if (pluginDeviceSet.has(_id))
+                continue;
+            for (const mixinId of getMixins(this, _id)) {
+                if (pluginDeviceSet.has(mixinId)) {
+                    this.getDevice(_id)?.probe().catch(() => { });
+                }
+            }
+        }
+
     }
 
     runPlugin(plugin: Plugin, pluginDebug?: PluginDebug) {
-        const pluginId = plugin._id;
-        this.killPlugin(pluginId);
-
-        const pluginDevices = this.findPluginDevices(pluginId);
-        for (const pluginDevice of pluginDevices) {
-            this.invalidatePluginDevice(pluginDevice._id);
-        }
-
-        const pluginHost = new PluginHost(this, plugin, pluginDebug);
-        this.setupPluginHostAutoRestart(pluginHost);
-        this.plugins[pluginId] = pluginHost;
-
+        const pluginHost = this.loadPlugin(plugin, pluginDebug);
+        this.probePluginDevices(plugin);
         return pluginHost;
     }
 
-    findPluginDevice?(pluginId: string, nativeId?: ScryptedNativeId): PluginDevice {
+    findPluginDevice(pluginId: string, nativeId?: ScryptedNativeId): PluginDevice {
         // JSON stringify over rpc turns undefined into null.
         if (nativeId === null)
             nativeId = undefined;
@@ -680,10 +810,12 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
                 continue;
             await this.removeDevice(provided);
         }
+        const providerId = device.state?.providerId?.value;
         device.state = undefined;
 
         this.invalidatePluginDevice(device._id);
         delete this.pluginDevices[device._id];
+        delete this.devices[device._id];
         await this.datastore.remove(device);
         this.stateManager.removeDevice(device._id);
 
@@ -695,13 +827,18 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         if (!device.nativeId) {
             this.killPlugin(device.pluginId);
             await this.datastore.removeId(Plugin, device.pluginId);
-            rimraf.sync(getPluginVolume(device.pluginId));
+            await fs.promises.rm(getPluginVolume(device.pluginId), {
+                recursive: true,
+                force: true,
+            });
         }
         else {
             try {
                 // notify the plugin that a device was removed.
                 const plugin = this.plugins[device.pluginId];
                 await plugin.remote.setNativeId(device.nativeId, undefined, undefined);
+                const provider = this.getDevice<DeviceProvider>(providerId);
+                await provider?.releaseDevice(device._id, device.nativeId);
             }
             catch (e) {
                 // may throw if the plugin is killed, etc.
@@ -786,18 +923,22 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
         return ret;
     }
 
-    killall() {
+    kill() {
         for (const host of Object.values(this.plugins)) {
             host?.kill();
         }
+    }
+
+    exit() {
+        this.kill();
         process.exit();
     }
 
     async start() {
         // catch ctrl-c
-        process.on('SIGINT', () => this.killall());
+        process.on('SIGINT', () => this.exit());
         // catch kill
-        process.on('SIGTERM', () => this.killall());
+        process.on('SIGTERM', () => this.exit());
 
         for await (const pluginDevice of this.datastore.getAll(PluginDevice)) {
             // this may happen due to race condition around deletion/update. investigate.
@@ -834,7 +975,11 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             }
 
             if (dirty) {
-                this.datastore.upsert(pluginDevice);
+                this.datastore.upsert(pluginDevice)
+                    .catch(e => {
+                        console.error('There was an error saving the device? Ignoring...', e);
+                        // return this.datastore.remove(pluginDevice);
+                    });
             }
         }
 
@@ -846,17 +991,40 @@ export class ScryptedRuntime extends PluginHttp<HttpPluginData> {
             }
         }
 
+        const plugins: Plugin[] = [];
         for await (const plugin of this.datastore.getAll(Plugin)) {
+            plugins.push(plugin);
+        }
+
+        for (const plugin of plugins) {
             try {
                 const pluginDevice = this.findPluginDevice(plugin._id);
                 setState(pluginDevice, ScryptedInterfaceProperty.info, {
                     manufacturer: plugin.packageJson.name,
                     version: plugin.packageJson.version,
                 } as DeviceInformation);
-                this.runPlugin(plugin);
+                this.loadPlugin(plugin);
             }
             catch (e) {
-                console.error('error starting plugin', plugin._id, e);
+                console.error('error loading plugin', plugin._id, e);
+            }
+        }
+
+        for (const plugin of plugins) {
+            try {
+                this.probePluginDevices(plugin);
+            }
+            catch (e) {
+                console.error('error probing plugin devices', plugin._id, e);
+            }
+        }
+
+        if (process.env.SCRYPTED_INSTALL_PLUGIN && !plugins.find(plugin => plugin._id === process.env.SCRYPTED_INSTALL_PLUGIN)) {
+            try {
+                await this.installNpm(process.env.SCRYPTED_INSTALL_PLUGIN);
+            }
+            catch (e) {
+                console.error('failed to auto install plugin', process.env.SCRYPTED_INSTALL_PLUGIN);
             }
         }
     }

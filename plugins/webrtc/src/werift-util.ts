@@ -1,5 +1,6 @@
-import { RTCIceServer, RTCPeerConnection, RTCSessionDescription } from "@koush/werift";
+import { RTCIceServer, RTCPeerConnection, RTCSessionDescription } from "./werift";
 import ip from 'ip';
+import os from 'os';
 
 export function createRawResponse(response: RTCSessionDescription): RTCSessionDescriptionInit {
     return {
@@ -42,23 +43,45 @@ export function getWeriftIceServers(configuration: RTCConfiguration): RTCIceServ
     return ret;
 }
 
-export function logIsPrivateIceTransport(console: Console, pc: RTCPeerConnection) {
-    let isPrivate = true;
+// node-ip is missing this range.
+// https://en.wikipedia.org/wiki/Reserved_IP_addresses
+const additionalPrivate = ip.cidrSubnet('198.18.0.0/15');
+function isPrivate(address: string) {
+    return ip.isPrivate(address) || additionalPrivate.contains(address);
+}
+
+export function isLocalIceTransport(pc: RTCPeerConnection) {
+    let isLocalNetwork = true;
+    let destinationId: string;
+    let type: string;
     for (const ice of pc.iceTransports) {
-        const [address, port] = ice.connection.remoteAddr;
-        const { turnServer } = ice.connection;
-        isPrivate = isPrivate && ip.isPrivate(address);
-        console.log('ice transport ip', {
-            address,
-            port,
-            turnServer: !!turnServer,
-        });
-        if (turnServer)
-            console.warn('Turn server is in use. For optimal performance ensure that your router supports source NAT.');
+        const { remoteAddr, localCandidate, remoteCandidate } = (ice.connection as any).nominated;
+        const [address, port] = remoteAddr;
+        type = remoteCandidate.type;
+        if (!destinationId)
+            destinationId = address;
+
+        let sameNetwork = false;
+        try {
+            const localAddress = Object.values(os.networkInterfaces()).flat().find(nif => nif.address === localCandidate.host);
+            sameNetwork = ip.cidrSubnet(localAddress.cidr).contains(address);
+        }
+        catch (e) {
+        }
+
+        isLocalNetwork = isLocalNetwork && (isPrivate(address) || sameNetwork);
     }
-    console.log('Connection is local network:', isPrivate);
+    const ipv4 = ip.isV4Format(destinationId);
     return {
-        isPrivate,
-        destinationId: pc.iceTransports[0]?.connection?.remoteAddr?.[0],
+        ipv4,
+        type,
+        isLocalNetwork,
+        destinationId,
     };
+}
+
+export function logIsLocalIceTransport(console: Console, pc: RTCPeerConnection) {
+    const ret = isLocalIceTransport(pc);
+    console.log('Connection is local network:', ret.isLocalNetwork, ret.destinationId, ret);
+    return ret;
 }

@@ -1,8 +1,6 @@
-import sdk, { FFmpegInput, Intercom, MediaObject, PictureOptions, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue } from "@scrypted/sdk";
-import { CameraProviderBase, CameraBase, UrlMediaStreamOptions } from "./common";
-import { StorageSettings } from "../../../common/src/settings";
-import { ffmpegLogInitialOutput, safePrintFFmpegArguments } from "../../../common/src/media-helpers";
-import child_process, { ChildProcess } from "child_process";
+import sdk, { FFmpegInput, MediaObject, Setting, SettingValue } from "@scrypted/sdk";
+import { StorageSettings } from "@scrypted/sdk/storage-settings";
+import { CameraBase, CameraProviderBase, UrlMediaStreamOptions } from "./common";
 
 const { mediaManager } = sdk;
 
@@ -17,10 +15,6 @@ function parseDoubleQuotedArguments(input: string) {
 }
 
 class FFmpegCamera extends CameraBase<UrlMediaStreamOptions> {
-    takePictureThrottled(option?: PictureOptions): Promise<MediaObject> {
-        throw new Error("The RTSP Camera does not provide snapshots. Install the Snapshot Plugin if snapshots are available via an URL.");
-    }
-
     storageSettings = new StorageSettings(this, {
         ffmpegInputs: {
             title: 'FFmpeg Input Stream Arguments',
@@ -81,7 +75,7 @@ class FFmpegCamera extends CameraBase<UrlMediaStreamOptions> {
     }
 
     getRawVideoStreamOptions(): UrlMediaStreamOptions[] {
-        const ffmpegInputs = this.storageSettings.values.ffmpegInputs as string[];
+        const ffmpegInputs = this.storageSettings.values.ffmpegInputs as string[] || [];
 
         // filter out empty strings.
         const ret = ffmpegInputs
@@ -89,7 +83,7 @@ class FFmpegCamera extends CameraBase<UrlMediaStreamOptions> {
             .map((ffmpegInput, index) => this.createFFmpegMediaStreamOptions(ffmpegInput, index));
 
         if (!ret.length)
-            return;
+            return [];
         return ret;
 
     }
@@ -130,11 +124,30 @@ class FFmpegCamera extends CameraBase<UrlMediaStreamOptions> {
         return mediaManager.createFFmpegMediaObject(ret);
     }
 
+    isAudioDisabled() {
+        return this.storage.getItem('noAudio') === 'true';
+    }
+   
+    async getOtherSettings(): Promise<Setting[]> {
+        return [
+            {
+                key: 'noAudio',
+                title: 'No Audio',
+                description: 'Enable this setting if the camera does not have audio or to mute audio.',
+                type: 'boolean',
+                value: (this.isAudioDisabled()).toString(),
+            },
+        ]
+    }
 }
 
 class FFmpegProvider extends CameraProviderBase<UrlMediaStreamOptions> {
     createCamera(nativeId: string): FFmpegCamera {
         return new FFmpegCamera(nativeId, this);
+    }
+
+    getScryptedDeviceCreator(): string {
+        return 'FFmpeg Camera';
     }
 }
 

@@ -1,10 +1,12 @@
+import type { ChildProcess as NodeChildProcess } from 'child_process';
 import type { Worker as NodeWorker } from 'worker_threads';
+import type { Socket as NodeNetSocket } from 'net';
 
 export type ScryptedNativeId = string | undefined;
 
 /**
  * All devices in Scrypted implement ScryptedDevice, which contains the id, name, and type. Add listeners to subscribe to events from that device.
- * 
+ *
  * @category Core Reference
  */
 export interface ScryptedDevice {
@@ -19,19 +21,21 @@ export interface ScryptedDevice {
 
   setType(type: ScryptedDeviceType): Promise<void>;
 
+  setMixins(mixins: string[]): Promise<void>;
+
   /**
    * Probes the device, ensuring creation of it and any mixins.
    */
   probe(): Promise<boolean>;
 
-  id?: string;
+  id: string;
   nativeId?: ScryptedNativeId;
-  pluginId?: string;
-  interfaces?: string[];
-  mixins?: string[];
+  pluginId: string;
+  interfaces: string[];
+  mixins: string[];
   name?: string;
   info?: DeviceInformation;
-  providedInterfaces?: string[];
+  providedInterfaces: string[];
   providedName?: ScryptedDeviceType;
   providedRoom?: string;
   providedType?: ScryptedDeviceType;
@@ -41,6 +45,13 @@ export interface ScryptedDevice {
 }
 export interface ScryptedPlugin {
   getPluginJson(): Promise<any>;
+}
+export interface ScryptedRuntimeArguments {
+  executable?: string;
+  arguments?: string[];
+}
+export interface ScryptedPluginRuntime {
+  scryptedRuntimeArguments?: ScryptedRuntimeArguments;
 }
 export interface EventListenerOptions {
   /**
@@ -55,6 +66,10 @@ export interface EventListenerOptions {
    * This EventListener will passively watch for events, and not initiate polling.
    */
   watch?: boolean;
+  /**
+   * The EventListener will listen to events and property changes from a device or mixin that is suppressed by a mixin.
+   */
+  mixinId?: string;
 }
 
 /**
@@ -64,14 +79,14 @@ export type EventListener = (eventSource: ScryptedDevice | undefined, eventDetai
 
 export interface EventDetails {
   eventId: string;
-  changed?: boolean;
   eventInterface?: string;
   eventTime: number;
   property?: string;
+  mixinId?: string;
 }
 /**
  * Returned when an event listener is attached to an EventEmitter. Call removeListener to unregister from events.
- * 
+ *
  * @category Core Reference
 */
 export interface EventListenerRegister {
@@ -122,6 +137,9 @@ export enum ScryptedDeviceType {
   Valve = "Valve",
   Person = "Person",
   SecuritySystem = "SecuritySystem",
+  WindowCovering = "WindowCovering",
+  Siren = "Siren",
+  AirPurifier = "AirPurifier",
   Unknown = "Unknown",
 }
 /**
@@ -196,36 +214,77 @@ export interface ColorHsv {
   v?: number;
 }
 
+export interface Buttons {
+  buttons?: ('doorbell' | string)[];
+}
+
+export interface Sensor {
+  name: string;
+  value?: string | number;
+  unit?: string;
+}
+
+export interface Sensors {
+  sensors: Record<string, Sensor>;
+}
+
+export interface PressButtons {
+  pressButton(button: string): Promise<void>;
+}
+
+export interface NotificationAction {
+  action: string;
+  icon?: string;
+  title: string;
+}
+
 export interface NotifierOptions {
-  actions?: NotificationAction[];
+  subtitle?: string;
   badge?: string;
+  bodyWithSubtitle?: string;
   body?: string;
+  android?: {
+    channel?: string;
+  }
   data?: any;
   dir?: NotificationDirection;
   lang?: string;
   renotify?: boolean;
   requireInteraction?: boolean;
   silent?: boolean;
+  critical?: boolean;
+  /**
+   * Collapse key/id.
+   */
   tag?: string;
-  timestamp?: EpochTimeStamp;
+  timestamp?: number;
   vibrate?: VibratePattern;
+  recordedEvent?: RecordedEvent & { id: string };
+
+  // removed from typescript dom?
+  actions?: NotificationAction[];
+  image?: string;
 }
 
 /**
  * Notifier can be any endpoint that can receive messages, such as speakers, phone numbers, messaging clients, etc. The messages may optionally contain media.
  */
 export interface Notifier {
-  sendNotification(title: string, options?: NotifierOptions, media?: MediaObject|string, icon?: MediaObject|string): Promise<void>;
+  sendNotification(title: string, options?: NotifierOptions, media?: MediaObject | string, icon?: MediaObject | string): Promise<void>;
 }
 /**
  * MediaObject is an intermediate object within Scrypted to represent all media objects. Plugins should use the MediaConverter to convert the Scrypted MediaObject into a desired type, whether it is a externally accessible URL, a Buffer, etc.
- * 
+ *
  * @category Media Reference
  */
 export interface MediaObject {
   mimeType: string;
   sourceId?: string;
+
+  toMimeTypes?: string[];
+  convert?<T>(toMimeType: string): Promise<T>;
 }
+
 /**
  * StartStop represents a device that can be started, stopped, and possibly paused and resumed. Typically vacuum cleaners or washers.
  */
@@ -251,24 +310,23 @@ export interface Dock {
 
   docked?: boolean;
 }
+
+export interface TemperatureCommand {
+  mode?: ThermostatMode;
+  setpoint?: number | [number, number];
+}
+export interface TemperatureSettingStatus {
+  availableModes?: ThermostatMode[];
+  mode?: ThermostatMode;
+  activeMode?: ThermostatMode;
+  setpoint?: number | [number, number];
+}
 /**
  * TemperatureSetting represents a thermostat device.
  */
 export interface TemperatureSetting {
-  setThermostatMode(mode: ThermostatMode): Promise<void>;
-
-  setThermostatSetpoint(degrees: number): Promise<void>;
-
-  setThermostatSetpointHigh(high: number): Promise<void>;
-
-  setThermostatSetpointLow(low: number): Promise<void>;
-
-  thermostatAvailableModes?: ThermostatMode[];
-  thermostatMode?: ThermostatMode;
-  thermostatActiveMode?: ThermostatMode;
-  thermostatSetpoint?: number;
-  thermostatSetpointHigh?: number;
-  thermostatSetpointLow?: number;
+  temperatureSetting?: TemperatureSettingStatus;
+  setTemperature(command: TemperatureCommand): Promise<void>;
 }
 export enum HumidityMode {
   Humidify = "Humidify",
@@ -368,9 +426,17 @@ export interface ResponsePictureOptions extends PictureOptions {
    * Flag that indicates that the request supports resizing to custom dimensions.
    */
   canResize?: boolean;
+  /**
+   * Flag that indicates the camera will return a stale/cached image.
+   */
+  staleDuration?: number;
 }
 export interface RequestPictureOptions extends PictureOptions {
-  reason?: 'user' | 'event';
+  /**
+   * periodic: The requestor will request the snapshot periodically so a recent cached image may be returned.
+   * event: The requestor needs an image for event processing or thumbnail. Cached or error images will not be returned.
+   */
+  reason?: 'periodic' | 'event';
   /**
    * Flag that hints whether this user request is happening due to a periodic refresh.
    */
@@ -379,6 +445,10 @@ export interface RequestPictureOptions extends PictureOptions {
    * Flag that hints whether multiple cameras are being refreshed by this user request. Can be used to prefetch the snapshots.
    */
   bulkRequest?: boolean;
+  /**
+   * The maximum time in milliseconds to wait for the picture.
+   */
+  timeout?: number;
 }
 /**
  * Camera devices can take still photos.
@@ -409,10 +479,8 @@ export interface VideoStreamOptions {
   minBitrate?: number;
   maxBitrate?: number;
   fps?: number;
-  /**
-   * Key Frame interval in milliseconds.
-   */
-  idrIntervalMillis?: number;
+  // what the heck is this?
+  quality?: number;
   /**
    * Key Frame interval in frames.
    */
@@ -420,14 +488,20 @@ export interface VideoStreamOptions {
   h264Info?: H264Info;
 }
 
+export interface RequestVideoStreamOptions extends VideoStreamOptions {
+  clientWidth?: number;
+  clientHeight?: number;
+}
+
 export interface AudioStreamOptions {
   codec?: string;
   encoder?: string;
   profile?: string;
   bitrate?: number;
+  sampleRate?: number;
 }
 
-export type MediaStreamSource = "local" | "cloud";
+export type MediaStreamSource = "local" | "cloud" | "synthetic";
 export type MediaStreamTool = 'ffmpeg' | 'scrypted' | 'gstreamer';
 
 /**
@@ -488,18 +562,34 @@ export interface ResponseMediaStreamOptions extends MediaStreamOptions {
   oobCodecParameters?: boolean;
 
   destinations?: MediaStreamDestination[];
+
+  /**
+   * Set this to true to allow for prebuffering even if the device implements the Battery interface.
+   * Handy if you have a device that can continuously prebuffer when on mains power, but you still
+   * want battery status reported.
+   */
+  allowBatteryPrebuffer?: boolean;
 }
 
 export type MediaStreamDestination = "local" | "remote" | "medium-resolution" | "low-resolution" | "local-recorder" | "remote-recorder";
 
+export interface RequestMediaStreamAdaptiveOptions {
+  packetLoss?: boolean;
+  pictureLoss?: boolean;
+  keyframe?: boolean;
+  reconfigure?: boolean;
+  resize?: boolean;
+}
+
 export interface RequestMediaStreamOptions extends MediaStreamOptions {
   /**
-   * When retrieving media, setting disableMediaProxies=true
-   * will bypass any intermediaries (NVR, rebroadcast) and retrieve
-   * it directly from the source. This is useful in cases when
-   * peer to peer connections are possible and preferred, such as WebRTC.
+   * When retrieving media, setting route directs how the media should be
+   * retrieved and exposed. A direct route will get the stream
+   * as is from the source. This will bypass any intermediaries if possible,
+   * such as an NVR or restreamers.
+   * An external route will request that that provided route is exposed to the local network.
    */
-  directMediaStream?: boolean;
+  route?: 'external' | 'direct' | 'internal';
 
   /**
    * Specify the stream refresh behavior when this stream is requested.
@@ -524,10 +614,19 @@ export interface RequestMediaStreamOptions extends MediaStreamOptions {
   destinationId?: string;
 
   /**
+   * The destination type of the target of this media stream. This
+   * should be the calling application package name. Used for logging
+   * or adaptive bitrate fingerprinting.
+   */
+  destinationType?: string;
+
+  /**
    * Request an adaptive bitrate stream, if available. The destination
    * will need to report packet loss indication.
    */
-  adaptive?: boolean;
+  adaptive?: boolean | RequestMediaStreamAdaptiveOptions;
+
+  video?: RequestVideoStreamOptions;
 }
 
 export interface MediaStreamPacketLoss {
@@ -538,11 +637,21 @@ export interface MediaStreamPacketLoss {
 
 export interface MediaStreamFeedback {
   onRtcp(buffer: Buffer): Promise<void>;
-  requestBitrate(bitrate: number): Promise<void>;
+  reconfigureStream(options: {
+    video: {
+      bitrate?: number;
+      width?: number;
+      height?: number;
+    },
+  }): Promise<void>;
   requestKeyframe(): Promise<void>;
   reportPacketLoss(report: MediaStreamPacketLoss): Promise<void>;
   reportPictureLoss(): Promise<void>;
   reportEstimatedMaxBitrate(bitrate: number): Promise<void>;
+  resizeStream(options: {
+    width: number;
+    height: number;
+  }): Promise<void>;
 }
 
 /**
@@ -550,6 +659,20 @@ export interface MediaStreamFeedback {
  */
 export interface Microphone {
   getAudioStream(): Promise<MediaObject>;
+}
+
+export interface AudioVolumes {
+  [key: string]: number;
+}
+
+export interface AudioVolumeControl {
+  audioVolumes?: AudioVolumes;
+  /**
+   * Set audio volumes for the device. Common keys are 'microphone', 'intercom',
+   * and 'speaker'.
+   * @param audioVolumes
+   */
+  setAudioVolumes(audioVolumes: AudioVolumes): Promise<void>;
 }
 
 /**
@@ -571,8 +694,154 @@ export interface VideoCamera {
   getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]>;
 }
 
+// {
+//   "qualityRange": {
+//     "min": 0,
+//     "max": 5
+//   },
+//   "H264": {
+//     "resolutionsAvailable": [
+//       {
+//         "width": 1280,
+//         "height": 720
+//       },
+//       {
+//         "width": 1920,
+//         "height": 1080
+//       },
+//       {
+//         "width": 2688,
+//         "height": 1520
+//       },
+//       {
+//         "width": 3072,
+//         "height": 1728
+//       },
+//       {
+//         "width": 3840,
+//         "height": 2160
+//       }
+//     ],
+//     "govLengthRange": {
+//       "min": 1,
+//       "max": 400
+//     },
+//     "frameRateRange": {
+//       "min": 1,
+//       "max": 30
+//     },
+//     "encodingIntervalRange": {
+//       "min": 1,
+//       "max": 1
+//     },
+//     "H264ProfilesSupported": [
+//       "Baseline",
+//       "Main",
+//       "High"
+//     ]
+//   },
+//   "extension": {
+//     "H264": {
+//       "resolutionsAvailable": [
+//         {
+//           "width": 1280,
+//           "height": 720
+//         },
+//         {
+//           "width": 1920,
+//           "height": 1080
+//         },
+//         {
+//           "width": 2688,
+//           "height": 1520
+//         },
+//         {
+//           "width": 3072,
+//           "height": 1728
+//         },
+//         {
+//           "width": 3840,
+//           "height": 2160
+//         }
+//       ],
+//       "govLengthRange": {
+//         "min": 1,
+//         "max": 400
+//       },
+//       "frameRateRange": {
+//         "min": 1,
+//         "max": 30
+//       },
+//       "encodingIntervalRange": {
+//         "min": 1,
+//         "max": 1
+//       },
+//       "H264ProfilesSupported": [
+//         "Baseline",
+//         "Main",
+//         "High"
+//       ],
+//       "bitrateRange": {
+//         "min": 32,
+//         "max": 16384
+//       }
+//     }
+//   }
+// }
+export interface VideoStreamConfiguration extends VideoStreamOptions {
+  resolutions?: [number, number][];
+  fpsRange?: [number, number];
+  keyframeIntervalRange?: [number, number];
+  bitrateRange?: [number, number];
+  qualityRange?: [number, number];
+  profiles?: string[];
+  bitrateControls?: string[];
+  codecs?: string[];
+}
+
+// audio streams seem more restrictive around what can be configured.
+// {
+//   "options": [
+//     {
+//       "encoding": "G711",
+//       "bitrateList": {
+//         "items": 64
+//       },
+//       "sampleRateList": {
+//         "items": 8
+//       }
+//     },
+//     {
+//       "encoding": "G726",
+//       "bitrateList": {
+//         "items": 16
+//       },
+//       "sampleRateList": {
+//         "items": 8
+//       }
+//     }
+//   ]
+// }
+
+export interface AudioStreamEncoding {
+  codec: string;
+  birates: number[];
+  sampleRates: number[];
+}
+
+export interface AudioStreamConfiguration extends AudioStreamOptions {
+  encodings?: AudioStreamEncoding[];
+}
+
+export interface MediaStreamConfiguration {
+  id?: string;
+  video?: VideoStreamConfiguration;
+  audio?: AudioStreamOptions;
+}
+
+// this is really just a mapping around onvif.
 export interface VideoCameraConfiguration {
-  setVideoStreamOptions(options: MediaStreamOptions): Promise<void>;
+  setVideoStreamOptions(options: MediaStreamOptions): Promise<MediaStreamConfiguration>;
 }
 
 export interface RequestRecordingStreamOptions extends RequestMediaStreamOptions {
@@ -580,6 +849,12 @@ export interface RequestRecordingStreamOptions extends RequestMediaStreamOptions
   duration?: number;
   loop?: boolean;
   playbackRate?: number;
+}
+
+export interface DeleteRecordingStreamOptions {
+  destination?: MediaStreamDestination;
+  startTime: number;
+  duration: number;
 }
 
 export interface RecordingStreamThumbnailOptions {
@@ -599,6 +874,8 @@ export interface RecordingStreamThumbnailOptions {
 }
 
 export interface VideoRecorder {
+  recordingActive?: boolean;
+
   /**
    * Returns a MediaObject for a recording stream.
    * @param options Options that denote where to start the recording stream.
@@ -614,6 +891,11 @@ export interface VideoRecorder {
   getRecordingStreamThumbnail(time: number, options?: RecordingStreamThumbnailOptions): Promise<MediaObject>;
 }
 
+export interface VideoRecorderManagement {
+  deleteRecordingStream(options: DeleteRecordingStreamOptions): Promise<void>;
+  setRecordingActive(recordingActive: boolean): Promise<void>
+}
+
 export interface RecordedEvent {
   details: EventDetails;
   data: any;
@@ -622,13 +904,21 @@ export interface RecordedEvent {
 export interface RecordedEventOptions {
   startTime?: number;
   endTime?: number;
-  startId?: string;
   count?: number;
-  reverseOrder?: boolean;
 }
 
 export interface EventRecorder {
   getRecordedEvents(options: RecordedEventOptions): Promise<RecordedEvent[]>;
+}
+
+export interface Resource {
+  file?: string;
+  href?: string;
+}
+
+export interface VideoResource {
+  thumbnail?: Resource;
+  video?: Resource;
 }
 
 export interface VideoClip {
@@ -640,38 +930,131 @@ export interface VideoClip {
   detectionClasses?: ObjectDetectionClass[];
   thumbnailId?: string;
   videoId?: string;
+  resources?: VideoResource;
 }
 
-export interface VideoClipOptions {
+export interface VideoClipOptions extends VideoClipThumbnailOptions {
   startTime?: number;
   endTime?: number;
-  startId?: string;
   count?: number;
-  reverseOrder?: boolean;
+}
+
+export interface VideoClipThumbnailOptions {
+  aspectRatio?: number;
 }
 
 export interface VideoClips {
   getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]>;
   getVideoClip(videoId: string): Promise<MediaObject>;
-  getVideoClipThumbnail(thumbnailId: string): Promise<MediaObject>;
+  getVideoClipThumbnail(thumbnailId: string, options?: VideoClipThumbnailOptions): Promise<MediaObject>;
   removeVideoClips(...videoClipIds: string[]): Promise<void>;
 }
 
 /**
- * Intercom devices can playback audio. 
+ * Intercom devices can playback audio.
  */
 export interface Intercom {
   startIntercom(media: MediaObject): Promise<void>;
   stopIntercom(): Promise<void>;
 }
 
-export interface PanTiltZoomCommand {
-  horizontal?: 'left' | 'right';
-  vertical?: 'up' | 'down';
+export interface PrivacyMask {
+  name?: string;
+  points: Point[];
 }
 
+export interface PrivacyMasks {
+  masks: PrivacyMask[];
+}
+
+export interface VideoCameraMask {
+  getPrivacyMasks(): Promise<PrivacyMasks>;
+  setPrivacyMasks(masks: PrivacyMasks): Promise<void>;
+}
+
+export interface VideoTextOverlay {
+  /**
+   * The top left position of the overlay in the image, normalized to 0-1.
+   */
+  origin?: Point;
+  fontSize?: number;
+  /**
+   * The text value to set the overlay to, if it is not readonly. True or false otherwise to enable/disable.
+   */
+  text?: string | boolean;
+  readonly?: boolean;
+}
+
+export interface VideoTextOverlays {
+  getVideoTextOverlays(): Promise<Record<string, VideoTextOverlay>>;
+  setVideoTextOverlay(id: string, value: VideoTextOverlay): Promise<void>;
+}
+
+export enum PanTiltZoomMovement {
+  Absolute = "Absolute",
+  Relative = "Relative",
+  Continuous = "Continuous",
+  Preset = "Preset",
+  Home = 'Home',
+}
+
+export interface PanTiltZoomCommand {
+  /**
+   * Specify the movement type. If unspecified, the movement will be relative to the current position.
+   */
+  movement?: PanTiltZoomMovement;
+  /**
+   * Ranges between -1 and 1.
+   */
+  pan?: number;
+  /**
+   * Ranges between -1 and 1.
+   */
+  tilt?: number;
+  /**
+   * Ranges between 0 and 1 for max zoom.
+   */
+  zoom?: number;
+  /**
+   * The speed of the movement.
+   */
+  speed?: {
+    /**
+     * Ranges between 0 and 1 for max zoom.
+     */
+    pan?: number;
+    /**
+     * Ranges between 0 and 1 for max zoom.
+     */
+    tilt?: number;
+    /**
+     * Ranges between 0 and 1 for max zoom.
+     */
+    zoom?: number;
+  };
+  /**
+   * The duration of the movement in milliseconds.
+   */
+  timeout?: number;
+  /**
+   * The preset to move to.
+   */
+  preset?: string;
+}
+
+export interface PanTiltZoomCapabilities {
+  pan?: boolean;
+  tilt?: boolean;
+  zoom?: boolean;
+  /**
+   * Preset id mapped to friendly name.
+   */
+  presets?: {
+    [key: string]: string;
+  };
+}
 export interface PanTiltZoom {
-  ptzCapabilities: any;
+  ptzCapabilities?: PanTiltZoomCapabilities;
 
   ptzCommand(command: PanTiltZoomCommand): Promise<void>;
 }
@@ -681,7 +1064,7 @@ export interface PanTiltZoom {
  */
 export interface Display {
   startDisplay(media: MediaObject): Promise<void>;
-  stopDisplay(media: MediaObject): Promise<void>;
+  stopDisplay(): Promise<void>;
 }
 
 /**
@@ -710,13 +1093,7 @@ export interface PasswordStore {
   removePassword(password: string): Promise<void>;
 
 }
-/**
- * Authenticator can be used to require a password before allowing interaction with a security device.
- */
-export interface Authenticator {
-  checkPassword(password: string): Promise<boolean>;
 
-}
 /**
  * Scenes control multiple different devices into a given state.
  */
@@ -741,11 +1118,11 @@ export interface Entry {
 
 }
 export interface EntrySensor {
-  entryOpen?: boolean;
+  entryOpen?: boolean | 'jammed';
 }
 /**
  * DeviceManager is the interface used by DeviceProvider to report new devices, device states, and device events to Scrypted.
- * 
+ *
  * @category Device Provider Reference
  */
 export interface DeviceManager {
@@ -757,12 +1134,12 @@ export interface DeviceManager {
   /**
    * Get the console for the device given a native id.
    */
-  getDeviceConsole?(nativeId?: ScryptedNativeId): Console;
+  getDeviceConsole(nativeId?: ScryptedNativeId): Console;
 
   /**
    * Get the console for the device given a native id.
    */
-  getMixinConsole?(mixinId: string, nativeId?: ScryptedNativeId): Console;
+  getMixinConsole(mixinId: string, nativeId?: ScryptedNativeId): Console;
 
   /**
    * Get the device state maintained by Scrypted. Setting properties on this state will update the state in Scrypted.
@@ -772,7 +1149,7 @@ export interface DeviceManager {
   /**
    * Create a device state object that will trap all state setting calls. Used internally by mixins and fork.
    */
-  createDeviceState?(id: string, setState: (property: string, value: any) => Promise<void>): DeviceState;
+  createDeviceState(id: string, setState: (property: string, value: any) => Promise<void>): WritableDeviceState;
 
   /**
    * Get the storage for a mixin.
@@ -823,19 +1200,25 @@ export interface DeviceManager {
 }
 /**
  * DeviceProvider acts as a controller/hub and exposes multiple devices to Scrypted Device Manager.
- * 
+ *
  * @category Device Provider Reference
  */
 export interface DeviceProvider {
   /**
    * Get an instance of a previously discovered device that was reported to the device manager.
+   * This method will be called every time onDeviceDiscovered or onDevicesChanged is invoked
+   * by the plugin. A previously returned instance may be returned again. If a different
+   * instance is returned, the plugin is responsible for cleaning up the old instance.
    */
   getDevice(nativeId: ScryptedNativeId): Promise<any>;
-
+  /**
+   * Called when a previously returned device from getDevice was deleted from Scrypted.
+   */
+  releaseDevice(id: string, nativeId: ScryptedNativeId): Promise<void>;
 }
 /**
  * DeviceManifest is passed to DeviceManager.onDevicesChanged to sync a full list of devices from the controller/hub (Hue, SmartThings, etc)
- * 
+ *
  * @category Device Provider Reference
  */
 export interface DeviceManifest {
@@ -850,27 +1233,49 @@ export interface DeviceCreatorSettings {
 }
 /**
  * A DeviceProvider that allows the user to create a device.
- * 
+ *
  * @category Device Provider Reference
  */
 export interface DeviceCreator {
   getCreateDeviceSettings(): Promise<Setting[]>;
   /**
-   * Implementation should return the native id of the created device.
-   * Callers will receive the id of the created device.
+   * Return the id of the created device.
    */
   createDevice(settings: DeviceCreatorSettings): Promise<string>;
 }
+export interface DiscoveredDevice {
+  name: string;
+  /**
+   * Identifying information such as IP Address or Serial Number.
+   */
+  description: string;
+  nativeId: ScryptedNativeId;
+  type: ScryptedDeviceType;
+  interfaces?: string[];
+  info?: DeviceInformation;
+  settings?: Setting[];
+}
+export interface AdoptDevice {
+  nativeId: ScryptedNativeId;
+  settings: DeviceCreatorSettings;
+}
 /**
  * A DeviceProvider that has a device discovery mechanism.
- * 
+ *
  * @category Device Provider Reference
  */
 export interface DeviceDiscovery {
   /**
-   * Perform device discovery for the specified duration in seconds.
+   * Perform device discovery, scanning if requested.
+   * If no scan is requested, the current list of discovered devices
+   * is returned.
    */
-  discoverDevices(duration: number): Promise<void>;
+  discoverDevices(scan?: boolean): Promise<DiscoveredDevice[]>;
+  /**
+   * Returns the id of the newly adopted device.
+   * @param device
+   */
+  adoptDevice(device: AdoptDevice): Promise<string>;
 }
 /**
  * Battery retrieves the battery level of battery powered devices.
@@ -878,9 +1283,29 @@ export interface DeviceDiscovery {
 export interface Battery {
   batteryLevel?: number;
 }
+export enum ChargeState {
+  Trickle = 'trickle',
+  Charging = 'charging',
+  NotCharging = 'not-charging',
+}
+/**
+ * Charger reports whether or not a device is being charged from an external power source.
+ * Usually used for battery powered devices.
+ */
+export interface Charger {
+  chargeState?: ChargeState;
+}
+
+export interface Sleep {
+  sleeping?: boolean;
+}
+
+export interface Reboot {
+  reboot(): Promise<void>;
+}
 /**
  * Refresh indicates that this device has properties that are not automatically updated, and must be periodically refreshed via polling. Device implementations should never implement their own underlying polling algorithm, and instead implement Refresh to allow Scrypted to manage polling intelligently.
- * 
+ *
  * @category Device Provider Reference
  */
 export interface Refresh {
@@ -939,30 +1364,26 @@ export interface Scriptable {
   loadScripts(): Promise<{ [filename: string]: ScriptSource }>;
   eval(source: ScriptSource, variables?: { [name: string]: any }): Promise<any>;
 }
-/**
- * SoftwareUpdate provides a way to check for updates and install them. This may be a Scrypted Plugin or device firmware.
- */
-export interface SoftwareUpdate {
-  checkForUpdate(): Promise<boolean>;
-
-  installUpdate(): Promise<void>;
-
-  updateAvailable?: boolean;
-}
-
-export interface BufferConvertorOptions {
-  sourceId?: string;
-}
 
 /**
  * Add a converter to be used by Scrypted to convert buffers from one mime type to another mime type.
  * May optionally accept string urls if accept-url is a fromMimeType parameter.
+ * @deprecated
  */
 export interface BufferConverter {
-  convert(data: string | Buffer | any, fromMimeType: string, toMimeType: string, options?: BufferConvertorOptions): Promise<MediaObject | Buffer | any>;
+  convert(data: string | Buffer | any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions): Promise<MediaObject | Buffer | any>;
 
   fromMimeType?: string;
   toMimeType?: string;
+}
+/**
+ * [fromMimeType, toMimeType]
+ */
+export type MediaConverterTypes = [string, string];
+export interface MediaConverter {
+  convertMedia(data: string | Buffer | any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions): Promise<MediaObject | Buffer | any>;
+
+  converters?: MediaConverterTypes[];
 }
 /**
  * Settings viewing and editing of device configurations that describe or modify behavior.
@@ -972,6 +1393,34 @@ export interface Settings {
 
   putSetting(key: string, value: SettingValue): Promise<void>;
 
+}
+
+/**
+ * SystemDevices are listed in the Scrypted UI.
+ */
+export interface ScryptedSystemDevice {
+  /**
+   * Type of device that will be created by this DeviceCreator.
+   * For example: Example Corp Camera or ACME Light Switch.
+   */
+  systemDevice?: ScryptedSystemDeviceInfo;
+}
+
+export interface ScryptedSystemDeviceInfo {
+  /**
+   * The name of the device as seen in System Settings.
+   */
+  settings?: string;
+  /**
+   * The description of device that will be created by this DeviceCreator.
+   * For example: Example Corp Camera or ACME Light Switch.
+   */
+  deviceCreator?: string;
+}
+
+export interface ScryptedSettings {
+}
+export interface ScryptedDeviceCreator {
 }
 export interface BinarySensor {
   binaryState?: boolean;
@@ -993,7 +1442,7 @@ export interface AmbientLightSensor {
   /**
    * The ambient light in lux.
    */
-  ambientLight: number;
+  ambientLight?: number;
 }
 export interface OccupancySensor {
   occupied?: boolean;
@@ -1018,6 +1467,36 @@ export interface Position {
 export interface PositionSensor {
   position?: Position;
 }
+export enum AirPurifierStatus {
+  Inactive = "Inactive",
+  Idle = "Idle",
+  Active = "Active",
+  ActiveNightMode = "ActiveNightMode",
+}
+
+export enum AirPurifierMode {
+  Manual = "Manual",
+  Automatic = "Automatic",
+}
+
+export interface AirPurifierState {
+  speed?: number;
+  status?: AirPurifierStatus,
+  mode?: AirPurifierMode,
+  lockPhysicalControls?: boolean,
+}
+
+export interface AirPurifier {
+  airPurifierState?: AirPurifierState;
+
+  setAirPurifierState(state: AirPurifierState): Promise<void>;
+}
+
+export interface FilterMaintenance {
+  filterLifeLevel?: number,
+  filterChangeIndication?: boolean,
+}
+
 export interface PM10Sensor {
   pm10Density?: number;
 }
@@ -1081,33 +1560,62 @@ export interface BoundingBoxResult {
    * x, y, width, height
    */
   boundingBox?: [number, number, number, number];
-  zoneHistory?: { [zone: string]: ObjectDetectionHistory };
   zones?: string[];
   history?: ObjectDetectionHistory;
 }
 export interface ObjectDetectionResult extends BoundingBoxResult {
+  /**
+   * The id of the tracked object.
+   */
   id?: string;
+  /**
+   * The certainty that this is correct tracked object.
+   */
+  cost?: number;
+  /**
+   * Flag that indicates whether the detection was clipped by the detection input and may not be a full bounding box.
+   */
+  clipped?: boolean;
+  /**
+   * The detection class of the object.
+   */
   className: ObjectDetectionClass;
+  /**
+   * Base64 encoded embedding float32 vector.
+   */
+  embedding?: string;
+  /**
+   * The label of the object, if it was recognized as a familiar object (person, pet, etc).
+   */
+  label?: string;
+  /**
+   * The score of the label.
+   */
+  labelScore?: number;
+  /**
+   * The detection landmarks, like key points in a face landmarks.
+   */
+  landmarks?: Point[];
+  /**
+   * The detection clip paths that outlines various features or segments, like traced facial features.
+   */
+  clipPaths?: ClipPath[];
   score: number;
+  resources?: VideoResource;
+  /**
+   * Movement history will track the first/last time this object was moving.
+   */
+  movement?: ObjectDetectionHistory & { moving?: boolean; };
 }
 export interface ObjectsDetected {
-  /**
-   * Object detection session state. Will be true if processing video, until
-   * the video ends or is timed out.
-   */
-  running?: boolean;
   detections?: ObjectDetectionResult[];
   /**
    * The id for the detection session.
    */
   detectionId?: string;
-  /**
-   * The id for this specific event/frame within a detection video session.
-   * Will be undefined for single image detections.
-   */
-  eventId?: any;
   inputDimensions?: [number, number],
   timestamp: number;
+  resources?: VideoResource;
 }
 export type ObjectDetectionClass = 'motion' | 'face' | 'person' | string;
 export interface ObjectDetectionTypes {
@@ -1116,6 +1624,12 @@ export interface ObjectDetectionTypes {
    * or the names of specific people.
    */
   classes?: ObjectDetectionClass[];
+}
+/**
+ * Given object detections with bounding boxes, return a similar list with tracker ids.
+ */
+export interface ObjectTracker {
+  trackObjects(detection: ObjectsDetected): Promise<ObjectsDetected>;
 }
 /**
  * ObjectDetector is found on Cameras that have smart detection capabilities.
@@ -1128,28 +1642,119 @@ export interface ObjectDetector {
   getDetectionInput(detectionId: string, eventId?: any): Promise<MediaObject>;
   getObjectTypes(): Promise<ObjectDetectionTypes>;
 }
-export interface ObjectDetectionSession {
-  detectionId?: string;
-  duration?: number;
+export interface ObjectDetectionGeneratorSession {
+  zones?: ObjectDetectionZone[];
   settings?: { [key: string]: any };
+  sourceId?: string;
+  clusterWorkerId?: ForkOptions['clusterWorkerId'];
+}
+export interface ObjectDetectionSession extends ObjectDetectionGeneratorSession {
+  /**
+   * Denotes that this is the first sample in a batch of samples.
+   */
+  batch?: number;
 }
 export interface ObjectDetectionModel extends ObjectDetectionTypes {
   name: string;
   inputSize?: number[];
+  inputFormat?: 'gray' | 'rgb' | 'rgba';
   settings: Setting[];
-  inputStream?: MediaStreamDestination;
+  triggerClasses?: string[];
+  prebuffer?: number;
+  decoder?: boolean;
 }
-export interface ObjectDetectionCallbacks {
-  onDetection(detection: ObjectsDetected, mediaObject?: MediaObject): Promise<boolean>;
-  onDetectionEnded(detection: ObjectsDetected): Promise<void>;
+export interface ObjectDetectionGeneratorResult {
+  __json_copy_serialize_children: true;
+  videoFrame: VideoFrame;
+  detected: ObjectsDetected;
+}
+export interface ObjectDetectionZone {
+  exclusion?: boolean;
+  type?: 'Intersect' | 'Contain';
+  classes?: string[];
+  path?: ClipPath;
 }
 /**
  * ObjectDetection can run classifications or analysis on arbitrary media sources.
  * E.g. TensorFlow, OpenCV, or a Coral TPU.
  */
 export interface ObjectDetection {
-  detectObjects(mediaObject: MediaObject, session?: ObjectDetectionSession, callbacks?: ObjectDetectionCallbacks): Promise<ObjectsDetected>;
+  generateObjectDetections(videoFrames: AsyncGenerator<VideoFrame, void> | MediaObject, session: ObjectDetectionGeneratorSession): Promise<AsyncGenerator<ObjectDetectionGeneratorResult, void>>;
+  detectObjects(mediaObject: MediaObject, session?: ObjectDetectionSession): Promise<ObjectsDetected>;
   getDetectionModel(settings?: { [key: string]: any }): Promise<ObjectDetectionModel>;
+}
+export interface ObjectDetectionPreview {
+}
+export interface ObjectDetectionGenerator {
+}
+export type ImageFormat = 'gray' | 'rgba' | 'rgb' | 'jpg' | string;
+export interface ImageOptions {
+  crop?: {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+  resize?: {
+    width?: number,
+    height?: number,
+    filter?: 'nearest' | 'bilinear' | 'lanczos' | 'mitchell',
+  };
+  format?: ImageFormat;
+}
+export interface Image {
+  width: number;
+  height: number;
+  /**
+   * The in raw memory format of this image.
+   * Operations of this image may only safely request
+   * this format, or a compressed format such as jpg.
+   */
+  format?: ImageFormat;
+  ffmpegFormats?: boolean;
+  toBuffer(options?: ImageOptions): Promise<Buffer>;
+  toImage(options?: ImageOptions): Promise<Image & MediaObject>;
+  close(): Promise<void>;
+}
+export interface VideoFrame {
+  __json_copy_serialize_children: true;
+  timestamp: number;
+  queued: number;
+  image: Image & MediaObject;
+  flush(count?: number): Promise<void>;
+}
+export interface VideoFrameGeneratorOptions extends ImageOptions {
+  queue?: number;
+  fps?: number;
+  firstFrameOnly?: boolean;
+  clusterWorkerId?: ForkOptions['clusterWorkerId'];
+}
+export interface VideoFrameGenerator {
+  generateVideoFrames(mediaObject: MediaObject, options?: VideoFrameGeneratorOptions): Promise<AsyncGenerator<VideoFrame, void>>;
+}
+/**
+ * Generic bidirectional stream connection.
+ */
+export interface StreamService<Input, Output = Input> {
+  connectStream(input?: AsyncGenerator<Input, void>, options?: any): Promise<AsyncGenerator<Output, void>>;
+}
+/**
+ * TTY connection offered by a remote device that can be connected to
+ * by an interactive terminal interface.
+ *
+ * Implementors should also implement StreamService to handle
+ * the actual data transfer.
+ */
+export interface TTY {
+}
+/**
+ * TTYSettings allows TTY backends to query plugins for modifications
+ * to the (non-)interactive terminal environment.
+ */
+export interface TTYSettings {
+  getTTYSettings(): Promise<{
+    paths?: string[];
+  }>;
 }
 /**
  * Logger is exposed via log.* to allow writing to the Scrypted log.
@@ -1219,6 +1824,8 @@ export interface OauthClient {
   onOauthCallback(callbackUrl: string): Promise<void>;
 
 }
+export type SerializableType = null | undefined | boolean | number | string | { [key: string]: SerializableType } | SerializableType[];
+export type TopLevelSerializableType = Function | Buffer | SerializableType;
 
 export interface MediaObjectOptions {
   /**
@@ -1227,16 +1834,17 @@ export interface MediaObjectOptions {
   sourceId?: string;
 }
 
+export interface MediaObjectCreateOptions extends MediaObjectOptions {
+  toMimeTypes?: string[];
+  convert?<T>(toMimeType: string): Promise<T>;
+
+  [key: string]: TopLevelSerializableType;
+}
+
 /**
  * @category Media Reference
  */
 export interface MediaManager {
-  /**
-   * Add an convertor to consider for use when converting MediaObjects.
-   */
-  addConverter(converter: BufferConverter): Promise<void>;
-  clearConverters(): Promise<void>;
-
   /**
    * Convert a media object to a Buffer, primtive type, or RPC Object.
    */
@@ -1270,19 +1878,19 @@ export interface MediaManager {
   /**
    * Create a MediaObject from FFmpeg input arguments.
    */
-  createFFmpegMediaObject(ffmpegInput: FFmpegInput, options?: MediaObjectOptions): Promise<MediaObject>;
+  createFFmpegMediaObject<T extends MediaObjectCreateOptions>(ffmpegInput: FFmpegInput, options?: T): Promise<MediaObject & T>;
 
   /**
    * Create a MediaObject from an URL. The mime type will be determined dynamically while resolving the url.
    */
-  createMediaObjectFromUrl(data: string, options?: MediaObjectOptions): Promise<MediaObject>;
+  createMediaObjectFromUrl<T extends MediaObjectCreateOptions>(data: string, options?: T): Promise<MediaObject & T>;
 
   /**
    * Create a MediaObject.
    * If the data is a buffer, JSON object, or primitive type, it will be serialized.
    * All other objects will be objects will become RPC objects.
    */
-  createMediaObject(data: any | Buffer, mimeType: string, options?: MediaObjectOptions): Promise<MediaObject>;
+  createMediaObject<T extends MediaObjectCreateOptions>(data: any | Buffer, mimeType: string, options?: T): Promise<MediaObject & T>;
 
   /**
    * Get the path to ffmpeg on the host system.
@@ -1294,17 +1902,35 @@ export interface MediaManager {
    */
   getFilesPath(): Promise<string>;
 }
-export interface MediaStreamUrl {
-  url: string;
+export interface MediaContainer {
   container?: string;
   mediaStreamOptions?: ResponseMediaStreamOptions;
 }
-export interface FFmpegInput extends MediaStreamUrl {
+export interface MediaStreamUrl extends MediaContainer {
+  url: string;
+}
+export interface FFmpegInput extends MediaContainer {
+  /**
+   * The media url for this FFmpegInput.
+   */
+  url?: string;
+  /**
+   * Alternate media urls for this FFmpegInput.
+   */
+  urls?: string[];
   inputArguments?: string[];
   destinationVideoBitrate?: number;
   h264EncoderArguments?: string[];
   videoDecoderArguments?: string[];
   h264FilterArguments?: string[];
+  /**
+   * Environment variables to set when launching FFmpeg.
+   */
+  env?: { [key: string]: string };
+  /**
+   * Path to a custom FFmpeg binary.
+   */
+  ffmpegPath?: string;
 }
 export interface DeviceInformation {
   model?: string;
@@ -1312,13 +1938,18 @@ export interface DeviceInformation {
   version?: string;
   firmware?: string;
   serialNumber?: string;
+  ip?: string;
   mac?: string;
   metadata?: any;
   managementUrl?: string;
+  deeplink?: {
+    apple?: string;
+    android?: string;
+  };
 }
 /**
  * Device objects are created by DeviceProviders when new devices are discover and synced to Scrypted via the DeviceManager.
- * 
+ *
  * @category Device Provider Reference
  */
 export interface Device {
@@ -1336,11 +1967,20 @@ export interface Device {
   providerNativeId?: ScryptedNativeId;
   room?: string;
 
-  internal?: boolean;
+  /**
+   * Directs Scrypted to purge any previously returned instances of the device and call getDevice on the DeviceProvider.
+   */
+  refresh?: boolean;
 }
+
+export interface EndpointAccessControlAllowOrigin {
+  nativeId?: ScryptedNativeId;
+  origins: string[];
+}
+
 /**
  * EndpointManager provides publicly accessible URLs that can be used to contact your Scrypted Plugin.
- * 
+ *
  * @category Webhook and Push Reference
  */
 export interface EndpointManager {
@@ -1375,9 +2015,12 @@ export interface EndpointManager {
   getPublicCloudEndpoint(nativeId?: ScryptedNativeId): Promise<string>;
 
   /**
-   * Get an URL pathname for a device that can be accessed without authentication. This is a relative path that can be used in browser sessions.
+   * Get an URL pathname for a device. This is a relative path that can be used in browser sessions.
    */
   getPath(nativeId?: ScryptedNativeId, options?: {
+    /**
+     * A public endpoint that does not require authentication with the local Scrypted server.
+     */
     public?: boolean,
   }): Promise<string>;
 
@@ -1397,7 +2040,6 @@ export interface EndpointManager {
 
   /**
    * Get an URL that can be externally accessed by anyone with the link. Plugin implementation is responsible for authentication.
-   * @deprecated
    */
   getCloudEndpoint(nativeId?: ScryptedNativeId, options?: {
     /**
@@ -1412,11 +2054,6 @@ export interface EndpointManager {
   getCloudPushEndpoint(nativeId?: ScryptedNativeId): Promise<string>;
 
   /**
-   * Deliver a push notification to a device. Used by push providers.
-   */
-  deliverPush(id: string, request: HttpRequest): Promise<void>;
-
-  /**
    * Set the recommended local addresses used by Scrypted plugins that listen for incoming connections.
    * @param addresses
    */
@@ -1426,10 +2063,19 @@ export interface EndpointManager {
    * Get the recommended local addresess used by Scrypted plugins that listen for incoming connections.
    */
   getLocalAddresses(): Promise<string[]>;
+
+
+  /**
+   * Set the allowed origins for an endpoint for cross origin requests.
+   * I.e. 'https://example.com' would allow cross origin requests from that origin.
+   * For security, this setting will not persist between plugin reloads and must
+   * be called per desired origin after plugin startup.
+   */
+  setAccessControlAllowOrigin(options: EndpointAccessControlAllowOrigin): Promise<void>;
 }
 /**
  * SystemManager is used by scripts to query device state and access devices.
- * 
+ *
  * @category Core Reference
  */
 export interface SystemManager {
@@ -1449,6 +2095,16 @@ export interface SystemManager {
   getDeviceById<T>(id: string): ScryptedDevice & T;
 
   /**
+   * Find a Scrypted device by pluginId and optionally the nativeId.
+   */
+  getDeviceById(pluginId: string, nativeId?: ScryptedNativeId): ScryptedDevice;
+
+  /**
+   * Find a Scrypted device by pluginId and optionally the nativeId.
+   */
+  getDeviceById<T>(pluginId: string, nativeId?: ScryptedNativeId): ScryptedDevice & T;
+
+  /**
    * Find a Scrypted device by name.
    */
   getDeviceByName(name: string): ScryptedDevice;
@@ -1457,12 +2113,6 @@ export interface SystemManager {
    * Find a Scrypted device by name.
    */
   getDeviceByName<T>(name: string): ScryptedDevice & T;
-
-  /**
-   * Get the current state of a device.
-   * @deprecated
-   */
-  getDeviceState(id: string): { [property: string]: SystemDeviceState };
 
   /**
    * Get the current state of every device.
@@ -1487,19 +2137,19 @@ export interface SystemManager {
 }
 /**
  * MixinProviders can add and intercept interfaces to other devices to add or augment their behavior.
- * 
+ *
  * @category Mixin Reference
  */
 export interface MixinProvider {
   /**
    * Called by the system to determine if this provider can create a mixin for the supplied device. Returns null if a mixin can not be created, otherwise returns a list of new interfaces (which may be an empty list) that are provided by the mixin.
    */
-  canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[]>;
+  canMixin(type: ScryptedDeviceType, interfaces: string[]): Promise<string[] | null | undefined | void>;
 
   /**
    * Create a mixin that can be applied to the supplied device.
    */
-  getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: DeviceState): Promise<any>;
+  getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState): Promise<any>;
 
   /**
    * Release a mixin device that was previously returned from getMixin.
@@ -1508,7 +2158,7 @@ export interface MixinProvider {
 }
 /**
  * The HttpRequestHandler allows handling of web requests under the endpoint path: /endpoint/npm-package-name/*.
- * 
+ *
  * @category Webhook and Push Reference
  */
 export interface HttpRequestHandler {
@@ -1529,26 +2179,28 @@ export interface HttpRequest {
   rootPath?: string;
   url?: string;
   username?: string;
+  aclId?: string;
 }
 /**
  * Response object provided by the HttpRequestHandler.
- * 
+ *
  * @category Webhook and Push Reference
  */
 export interface HttpResponse {
-  send(body: string): void;
+  send(body: string, options?: HttpResponseOptions): void;
 
-  send(body: string, options: HttpResponseOptions): void;
+  send(body: Buffer, options?: HttpResponseOptions): void;
 
-  send(body: Buffer): void;
+  sendFile(path: string, options?: HttpResponseOptions): void;
 
-  send(body: Buffer, options: HttpResponseOptions): void;
+  /**
+   * @deprecated
+   * @param socket 
+   * @param options 
+   */
+  sendSocket(socket: any, options?: HttpResponseOptions): void;
 
-  sendFile(path: string): void;
-
-  sendFile(path: string, options: HttpResponseOptions): void;
-
-  sendSocket(socket: any, options: HttpResponseOptions): void;
+  sendStream(stream: AsyncGenerator<Buffer, void>, options?: HttpResponseOptions): void;
 }
 /**
  * @category Webhook and Push Reference
@@ -1558,12 +2210,12 @@ export interface HttpResponseOptions {
   headers?: object;
 }
 export interface EngineIOHandler {
-  onConnection(request: HttpRequest, webSocketUrl: string): Promise<void>;
+  onConnection(request: HttpRequest, webSocket: WebSocket): Promise<void>;
 
 }
 /**
  * @category Webhook and Push Reference
- * 
+ *
  */
 export interface PushHandler {
   /**
@@ -1572,15 +2224,8 @@ export interface PushHandler {
   onPush(request: HttpRequest): Promise<void>;
 
 }
+// the value is wrapped to add additional properties later for backwards compat or whatever.
 export interface SystemDeviceState {
-  /**
-   * The last time the state was updated, even if it did not change.
-   */
-  lastEventTime?: number;
-  /**
-   * The last time the state changed.
-   */
-  stateTime?: number;
   value?: any;
 }
 export interface MediaStatus {
@@ -1595,14 +2240,17 @@ export enum MediaPlayerState {
   Paused = "Paused",
   Buffering = "Buffering",
 }
-export type SettingValue = undefined | null | string | number | boolean | string[] | number[];
+export type SettingValue = undefined | null | string | number | boolean | string[] | number[] | ClipPath;
+export type Point = [number, number];
+export type ClipPath = Point[];
 export interface Setting {
   key?: string;
   title?: string;
   group?: string;
+  subgroup?: string;
   description?: string;
   placeholder?: string;
-  type?: 'string' | 'password' | 'number' | 'boolean' | 'device' | 'integer' | 'button' | 'clippath' | 'interface' | 'qrcode' | 'textarea';
+  type?: 'string' | 'password' | 'number' | 'boolean' | 'device' | 'integer' | 'button' | 'clippath' | 'interface' | 'html' | 'textarea' | 'date' | 'time' | 'datetime' | 'day' | 'script';
   /**
    * The range of allowed numbers, if any, when the type is 'number'.
    */
@@ -1612,6 +2260,14 @@ export interface Setting {
   combobox?: boolean;
   deviceFilter?: string;
   multiple?: boolean;
+  /**
+   * Flag that the UI should immediately apply this setting.
+   */
+  immediate?: boolean;
+  /**
+   * Flag that hte UI should open the console.
+   */
+  console?: boolean;
   value?: SettingValue;
 }
 
@@ -1623,6 +2279,7 @@ export interface LauncherApplicationInfo {
   icon?: string;
   description?: string;
   href?: string;
+  cloudHref?: string;
 }
 
 export interface LauncherApplication {
@@ -1632,11 +2289,15 @@ export interface LauncherApplication {
 export enum ScryptedInterface {
   ScryptedDevice = "ScryptedDevice",
   ScryptedPlugin = "ScryptedPlugin",
+  ScryptedPluginRuntime = "ScryptedPluginRuntime",
   OnOff = "OnOff",
   Brightness = "Brightness",
   ColorSettingTemperature = "ColorSettingTemperature",
   ColorSettingRgb = "ColorSettingRgb",
   ColorSettingHsv = "ColorSettingHsv",
+  Buttons = "Buttons",
+  PressButtons = "PressButtons",
+  Sensors = "Sensors",
   Notifier = "Notifier",
   StartStop = "StartStop",
   Pause = "Pause",
@@ -1646,9 +2307,13 @@ export enum ScryptedInterface {
   HumiditySensor = "HumiditySensor",
   Camera = "Camera",
   Microphone = "Microphone",
+  AudioVolumeControl = "AudioVolumeControl",
   Display = "Display",
   VideoCamera = "VideoCamera",
+  VideoCameraMask = "VideoCameraMask",
+  VideoTextOverlays = "VideoTextOverlays",
   VideoRecorder = "VideoRecorder",
+  VideoRecorderManagement = "VideoRecorderManagement",
   PanTiltZoom = "PanTiltZoom",
   EventRecorder = "EventRecorder",
   VideoClips = "VideoClips",
@@ -1656,7 +2321,6 @@ export enum ScryptedInterface {
   Intercom = "Intercom",
   Lock = "Lock",
   PasswordStore = "PasswordStore",
-  Authenticator = "Authenticator",
   Scene = "Scene",
   Entry = "Entry",
   EntrySensor = "EntrySensor",
@@ -1664,14 +2328,17 @@ export enum ScryptedInterface {
   DeviceDiscovery = "DeviceDiscovery",
   DeviceCreator = "DeviceCreator",
   Battery = "Battery",
+  Charger = "Charger",
+  Reboot = "Reboot",
   Refresh = "Refresh",
   MediaPlayer = "MediaPlayer",
   Online = "Online",
-  SoftwareUpdate = "SoftwareUpdate",
   BufferConverter = "BufferConverter",
+  MediaConverter = "MediaConverter",
   Settings = "Settings",
   BinarySensor = "BinarySensor",
   TamperSensor = "TamperSensor",
+  Sleep = "Sleep",
   PowerSensor = "PowerSensor",
   AudioSensor = "AudioSensor",
   MotionSensor = "MotionSensor",
@@ -1688,6 +2355,8 @@ export enum ScryptedInterface {
   NOXSensor = "NOXSensor",
   CO2Sensor = "CO2Sensor",
   AirQualitySensor = "AirQualitySensor",
+  AirPurifier = "AirPurifier",
+  FilterMaintenance = "FilterMaintenance",
   Readme = "Readme",
   OauthClient = "OauthClient",
   MixinProvider = "MixinProvider",
@@ -1696,13 +2365,26 @@ export enum ScryptedInterface {
   PushHandler = "PushHandler",
   Program = "Program",
   Scriptable = "Scriptable",
+  ClusterForkInterface = "ClusterForkInterface",
+  ObjectTracker = "ObjectTracker",
   ObjectDetector = "ObjectDetector",
   ObjectDetection = "ObjectDetection",
+  ObjectDetectionPreview = "ObjectDetectionPreview",
+  ObjectDetectionGenerator = "ObjectDetectionGenerator",
   HumiditySetting = "HumiditySetting",
   Fan = "Fan",
   RTCSignalingChannel = "RTCSignalingChannel",
   RTCSignalingClient = "RTCSignalingClient",
   LauncherApplication = "LauncherApplication",
+  ScryptedUser = "ScryptedUser",
+  VideoFrameGenerator = 'VideoFrameGenerator',
+  StreamService = 'StreamService',
+  TTY = 'TTY',
+  TTYSettings = 'TTYSettings',
+
+  ScryptedSystemDevice = "ScryptedSystemDevice",
+  ScryptedDeviceCreator = "ScryptedDeviceCreator",
+  ScryptedSettings = "ScryptedSettings",
 }
 
 /**
@@ -1712,13 +2394,21 @@ export type RTCSignalingSendIceCandidate = (candidate: RTCIceCandidateInit) => P
 
 /**
  * Implemented by WebRTC cameras to negotiate a peer connection session with Scrypted.
- * 
+ *
  * @category WebRTC Reference
  */
 export interface RTCSignalingSession {
+  __proxy_props: {
+    options: RTCSignalingOptions;
+  };
+  options: RTCSignalingOptions;
+
   createLocalDescription(type: 'offer' | 'answer', setup: RTCAVSignalingSetup, sendIceCandidate: undefined | RTCSignalingSendIceCandidate): Promise<RTCSessionDescriptionInit>;
   setRemoteDescription(description: RTCSessionDescriptionInit, setup: RTCAVSignalingSetup): Promise<void>;
   addIceCandidate(candidate: RTCIceCandidateInit): Promise<void>;
+  /**
+   * @deprecated
+   */
   getOptions(): Promise<RTCSignalingOptions>;
 }
 
@@ -1731,7 +2421,15 @@ export interface RTCSignalingOptions {
    */
   offer?: RTCSessionDescriptionInit;
   requiresOffer?: boolean;
+  requiresAnswer?: boolean;
+  /**
+   * Disables trickle ICE. All candidates must be sent in the initial offer/answer sdp.
+   */
   disableTrickle?: boolean;
+  /**
+   * Disables usage of TURN servers, if this client exposes public addresses or provides its own.
+   */
+  disableTurn?: boolean;
   /**
    * Hint to proxy the feed, as the target client may be inflexible.
    */
@@ -1742,13 +2440,14 @@ export interface RTCSignalingOptions {
   };
   userAgent?: string;
   screen?: {
+    devicePixelRatio: number;
     width: number;
     height: number;
   };
 }
 
 /**
- * A flexible RTC signaling endpoint, typically a browser, that can handle offer and answer. 
+ * A flexible RTC signaling endpoint, typically a browser, that can handle offer and answer.
  * Like Chromecast, etc, which has a Chromecast AppId that can connect to Scrypted.
  */
 export interface RTCSignalingClient {
@@ -1771,12 +2470,25 @@ export interface RTCSessionControl {
  * @category WebRTC Reference
  */
 export interface RTCMediaObjectTrack {
-  replace(mediaObject: MediaObject): Promise<void>;
+  onStop(): Promise<void>;
   stop(): Promise<void>;
+}
+
+/**
+ * @category WebRTC Reference
+ */
+export interface RTCOutputMediaObjectTrack extends RTCMediaObjectTrack {
+  replace(mediaObject: MediaObject): Promise<void>;
+}
+
+/**
+ * @category WebRTC Reference
+ */
+export interface RTCInputMediaObjectTrack extends RTCMediaObjectTrack {
   setPlayback(options: {
     audio: boolean,
     video: boolean,
-  }): Promise<void>;
+  }): Promise<MediaObject>;
 }
 
 /**
@@ -1787,16 +2499,24 @@ export interface RTCConnectionManagement {
   addTrack(mediaObject: MediaObject, options?: {
     videoMid?: string,
     audioMid?: string,
+    /**
+     * @deprecated
+     */
     intercomId?: string,
-  }): Promise<RTCMediaObjectTrack>;
+  }): Promise<RTCOutputMediaObjectTrack>;
+  addInputTrack(options: {
+    videoMid?: string,
+    audioMid?: string,
+  }): Promise<RTCInputMediaObjectTrack>;
   close(): Promise<void>;
+  probe(): Promise<void>;
 }
 
 /**
  * An inflexible RTC Signaling channel, typically a vendor, like Nest or Ring.
  * They generally can only handle either offer or answer, but not both. Usually has
  * strict requirements and expectations on client setup.
- * 
+ *
  * @category WebRTC Reference
  */
 export interface RTCSignalingChannel {
@@ -1811,8 +2531,12 @@ export interface RTCAVSignalingSetup {
    * Mechanism to allow configuration of TURN/STUN servers, etc.
    */
   configuration?: RTCConfiguration;
-  audio: RTCRtpTransceiverInit;
-  video: RTCRtpTransceiverInit;
+  audio?: RTCRtpTransceiverInit;
+  video?: RTCRtpTransceiverInit;
+  /**
+   * Some endpoints like Ring do not stream to Safari unless getUserMedia is called. Unclear why.
+   */
+  getUserMediaSafariHack?: boolean;
   datachannel?: {
     label: string;
     dict?: RTCDataChannelInit;
@@ -1824,6 +2548,7 @@ export enum ScryptedMimeTypes {
   Url = 'text/x-uri',
   InsecureLocalUrl = 'text/x-insecure-local-uri',
   LocalUrl = 'text/x-local-uri',
+  ServerId = 'text/x-server-id',
 
   PushEndpoint = 'text/x-push-endpoint',
 
@@ -1834,8 +2559,6 @@ export enum ScryptedMimeTypes {
   RequestMediaObject = 'x-scrypted/x-scrypted-request-media-object',
   RequestMediaStream = 'x-scrypted/x-scrypted-request-stream',
   MediaStreamFeedback = 'x-scrypted/x-media-stream-feedback',
-  ScryptedDevice = 'x-scrypted/x-scrypted-device',
-  ScryptedDeviceId = 'x-scrypted/x-scrypted-device-id',
 
   FFmpegInput = 'x-scrypted/x-ffmpeg-input',
   FFmpegTranscodeStream = 'x-scrypted/x-ffmpeg-transcode-stream',
@@ -1843,6 +2566,8 @@ export enum ScryptedMimeTypes {
   RTCSignalingChannel = 'x-scrypted/x-scrypted-rtc-signaling-channel',
   RTCSignalingSession = 'x-scrypted/x-scrypted-rtc-signaling-session',
   RTCConnectionManagement = 'x-scrypted/x-scrypted-rtc-connection-management',
+
+  Image = 'x-scrypted/x-scrypted-image',
 }
 
 export type RequestMediaObject = () => Promise<MediaObject>;
@@ -1855,9 +2580,166 @@ export interface FFmpegTranscode {
 }
 export type FFmpegTranscodeStream = (options: FFmpegTranscode) => Promise<void>;
 
-export interface PluginFork<T> {
+export interface ClusterForkInterfaceOptions extends Required<Pick<ForkOptions, 'clusterWorkerId'>>, Pick<ForkOptions, 'id' | 'nativeId'> {
+}
+
+/**
+ * Requests that the ScryptedDevice create a fork to 
+ */
+export interface ClusterForkInterface {
+  forkInterface(forkInterface: ScryptedInterface.ObjectDetection, options?: ClusterForkInterfaceOptions): Promise<ObjectDetection>;
+  forkInterface<T>(forkInterface: ScryptedInterface, options?: ClusterForkInterfaceOptions): Promise<T>;
+}
+
+export interface ForkWorker extends Disposable {
+  terminate(): void;
+  on(event: 'exit', listener: () => void): void;
+  removeListener(event: 'exit', listener: () => void): void;
+  on(event: 'error', listener: () => void): void;
+  removeListener(event: 'error', listener: (e: Error) => void): void;
+  nativeWorker?: NodeChildProcess | NodeWorker;
+}
+export interface PluginFork<T> extends Disposable {
+  /**
+   * The id of the cluster worker that is executing this fork when in cluster mode.
+   */
+  clusterWorkerId?: Promise<string>;
   result: Promise<T>;
-  worker: NodeWorker;
+  worker: ForkWorker;
+}
+
+export declare interface DeviceState {
+  id: string;
+}
+
+export interface WritableDeviceState extends DeviceState {
+  setState(property: string, value: any): Promise<void>;
+}
+
+export interface ScryptedInterfaceDescriptor {
+  name: string;
+  properties: string[];
+  methods: string[];
+}
+
+/**
+ * ScryptedDeviceAccessControl describes the methods and properties on a device
+ * that will be visible to the user.
+ * If methods is nullish, the user will be granted full access to all methods.
+ * If properties is nullish, the user will be granted full access to all properties.
+ * If events is nullish, the user will be granted full access to all events.
+ */
+export interface ScryptedDeviceAccessControl {
+  id: string;
+  methods?: string[];
+  properties?: string[];
+  interfaces?: string[];
+}
+
+/**
+ * ScryptedUserAccessControl describes the list of devices that
+ * may be accessed by the user.
+ */
+export interface ScryptedUserAccessControl {
+  /**
+   * If devicesAccessControls is null, the user has full access to all devices.
+   */
+  devicesAccessControls?: ScryptedDeviceAccessControl[] | null;
+}
+
+/**
+ * ScryptedUser represents a user managed by Scrypted.
+ * This interface can not be implemented, only extended by Mixins.
+ */
+export interface ScryptedUser {
+  /**
+   * Retrieve the ScryptedUserAccessControl for a user. If no access control object is returned
+   * the user has full access to all devices. This differs from an admin user that can also
+   * access admin related system services.
+   */
+  getScryptedUserAccessControl(): Promise<ScryptedUserAccessControl>;
+}
+
+export interface APIOptions {
+  username?: string;
+  accessControls?: ScryptedUserAccessControl;
+}
+
+export interface ConnectOptions extends APIOptions {
+  pluginId: string;
+}
+
+export interface ForkOptions {
+  /**
+   * The name of this fork. This will be used to set the thread name
+   */
+  name?: string;
+  /**
+   * The runtime to use for this fork. If not specified, the current runtime will be used.
+   */
+  runtime?: string;
+  /**
+   * The filename to execute in the fork. Not supported in all runtimes.
+   */
+  filename?: string;
+  /**
+   * The id of the device that is associated with this fork.
+   */
+  id?: string;
+  /**
+   * The native id of the mixin that is associated with this fork.
+   */
+  nativeId?: ScryptedNativeId;
+
+  /**
+   * The id of the cluster worker id that will execute this fork.
+   */
+  clusterWorkerId?: string;
+  /**
+   * The labels used to select the cluster worker that will execute this fork.
+   */
+  labels?: {
+    /**
+     * The worker must have all these labels.
+     */
+    require?: string[];
+    /**
+     * The worker must have one of these labels.
+     */
+    any?: string[];
+    /**
+     * The worker is preferred to have one of these labels.
+     * The nearest match will be selected.
+     */
+    prefer?: string[];
+  };
+}
+
+export interface ClusterFork {
+  runtime?: ForkOptions['runtime'];
+  labels?: ForkOptions['labels'];
+  id?: ForkOptions['id'];
+  clusterWorkerId: ForkOptions['clusterWorkerId'];
+}
+
+export interface ClusterWorker {
+  name: string;
+  id: string;
+  labels: string[];
+  forks: ClusterFork[];
+  mode: 'server' | 'client';
+  address: string;
+}
+
+export interface ClusterManager {
+  /**
+   * Returns the id of this cluster worker.
+   * Returns undefined if this is not a cluster worker.
+   */
+  getClusterWorkerId(): string;
+  getClusterAddress(): string;
+  getClusterMode(): 'server' | 'client' | undefined;
+  getClusterWorkers(): Promise<Record<string, ClusterWorker>>;
 }
 
 export interface ScryptedStatic {
@@ -1870,20 +2752,29 @@ export interface ScryptedStatic {
   endpointManager: EndpointManager,
   mediaManager: MediaManager,
   systemManager: SystemManager,
+  clusterManager: ClusterManager;
+
+  serverVersion: string;
 
   pluginHostAPI: any;
   pluginRemoteAPI: any;
 
-  fork?<T>(): PluginFork<T>;
-}
-
-export declare interface DeviceState {
-  id?: string;
-  setState?(property: string, value: any): Promise<void>;
-}
-
-export interface ScryptedInterfaceDescriptor {
-  name: string;
-  properties: string[];
-  methods: string[];
+  /**
+   * Start a new instance of the plugin, returning an instance of the new process
+   * and the result of the fork method.
+   */
+  fork<T>(options?: ForkOptions): PluginFork<T>;
+  /**
+   * Initiate the Scrypted RPC wire protocol on a socket.
+   * @param socket
+   * @param options
+   */
+  connect(socket: NodeNetSocket, options?: ConnectOptions): void;
+  /**
+   * Attempt to retrieve an RPC object by directly connecting to the plugin
+   * that created the object. All operations on this object will bypass routing
+   * through the Scrypted Server which typically manages plugin communication.
+   * This is ideal for sending large amounts of data.
+   */
+  connectRPCObject<T>(value: T): Promise<T>;
 }

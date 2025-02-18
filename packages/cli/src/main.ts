@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 
+import { connectScryptedClient } from '@scrypted/client';
+import { FFmpegInput, ScryptedMimeTypes } from '@scrypted/types';
+import child_process from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import axios, { AxiosRequestConfig } from 'axios';
 import readline from 'readline-sync';
-import https from 'https';
-import mkdirp from 'mkdirp';
-import { installServe, serveMain } from './service';
-import { connectScryptedClient } from '../../client/src/index';
-import { ScryptedMimeTypes, FFMpegInput } from '@scrypted/types';
 import semver from 'semver';
-import child_process from 'child_process';
+import { httpFetch } from '../../../server/src/fetch/http-fetch';
+import { installServe, serveMain } from './service';
+import { connectShell } from './shell';
+import { convertRtspToMp4, printRtspUsage } from './rtsp-file';
 
 if (!semver.gte(process.version, '16.0.0')) {
     throw new Error('"node" version out of date. Please update node to v16 or higher.')
@@ -41,6 +41,12 @@ interface LoginFile {
     [host: string]: Login;
 }
 
+function basicAuthHeaders(username: string, password: string) {
+    const headers = new Headers();
+    headers.set('Authorization', `Basic ${Buffer.from(username + ":" + password).toString('base64')}`);
+    return headers;
+}
+
 async function doLogin(host: string) {
     host = toIpAndPort(host);
 
@@ -50,16 +56,19 @@ async function doLogin(host: string) {
     });
 
     const url = `https://${host}/login`;
-    const response = await axios(Object.assign({
+    const response = await httpFetch({
         method: 'GET',
-        auth: {
-            username,
-            password,
-        },
+        headers: basicAuthHeaders(username, password),
         url,
-    }, axiosConfig));
+        rejectUnauthorized: false,
+        responseType: 'json',
+    });
+    if (response.body.error)
+        throw new Error(response.body.error);
 
-    mkdirp.sync(scryptedHome);
+    fs.mkdirSync(scryptedHome, {
+        recursive: true,
+    });
     let login: LoginFile;
     try {
         login = JSON.parse(fs.readFileSync(loginPath).toString());
@@ -71,15 +80,12 @@ async function doLogin(host: string) {
         login = {};
     login = login || {};
 
-    login[host] = response.data;
+    login[host] = response.body;
     fs.writeFileSync(loginPath, JSON.stringify(login));
-    return login;
+    return login[host];
 }
 
-async function getOrDoLogin(host: string): Promise<{
-    username: string,
-    token: string,
-}> {
+async function getOrDoLogin(host: string): Promise<Login> {
     let login: LoginFile;
     try {
         login = JSON.parse(fs.readFileSync(loginPath).toString());
@@ -88,17 +94,12 @@ async function getOrDoLogin(host: string): Promise<{
 
         if (!login[host].username || !login[host].token)
             throw new Error();
+
+        return login[host];
     }
     catch (e) {
-        login = await doLogin(host);
+        return doLogin(host);
     }
-    return login[host];
-}
-
-const axiosConfig: AxiosRequestConfig = {
-    httpsAgent: new https.Agent({
-        rejectUnauthorized: false
-    })
 }
 
 async function runCommand() {
@@ -118,7 +119,7 @@ async function runCommand() {
     if (!device)
         throw new Error('device not found: ' + idOrName);
     const method = process.argv[4];
-    const args = process.argv.slice(5).map(arg => () => {
+    const args = process.argv.slice(5).map(arg => {
         try {
             return JSON.parse(arg);
         }
@@ -142,13 +143,14 @@ async function main() {
         await serveMain(installVersion);
     }
     else if (process.argv[2] === 'install-server') {
-        const installDir = await installServe('latest');
+        console.log('install-server version:', process.argv[3]);
+        const installDir = await installServe(process.argv[3] || 'latest');
         console.log('server installation successful:', installDir);
     }
     else if (process.argv[2] === 'login') {
         const ip = process.argv[3] || '127.0.0.1';
-        const token = await doLogin(ip);
-        console.log('login successful. token:', token);
+        const login = await doLogin(ip);
+        console.log('login successful. token:', login.token);
     }
     else if (process.argv[2] === 'command') {
         const { sdk, pendingResult } = await runCommand();
@@ -156,12 +158,29 @@ async function main() {
     }
     else if (process.argv[2] === 'ffplay') {
         const { sdk, pendingResult } = await runCommand();
-        const ffinput = await sdk.mediaManager.convertMediaObjectToJSON<FFMpegInput>(await pendingResult, ScryptedMimeTypes.FFmpegInput);
-        console.log(ffinput);
-        child_process.spawn('ffplay', ffinput.inputArguments, {
+        const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(await pendingResult, ScryptedMimeTypes.FFmpegInput);
+        if (ffmpegInput.url && ffmpegInput.urls?.[0]) {
+            const url = new URL(ffmpegInput.url);
+            if (url.hostname === '127.0.0.1' && ffmpegInput.urls?.[0] && ffmpegInput.inputArguments) {
+                ffmpegInput.inputArguments = ffmpegInput.inputArguments.map(i => i === ffmpegInput.url && ffmpegInput.urls ? ffmpegInput.urls?.[0] : i);
+            }
+        }
+        const args = ffmpegInput.inputArguments ? [...ffmpegInput.inputArguments] : [];
+        if (ffmpegInput.h264FilterArguments)
+            args.push(...ffmpegInput.h264FilterArguments);
+        console.log('ffplay', ...args);
+        child_process.spawn('ffplay', args, {
             stdio: 'inherit',
         });
         sdk.disconnect();
+    }
+    else if (process.argv[2] === 'rtsp') {
+        if (!process.argv[3]) {
+            printRtspUsage();
+            process.exit(1);
+        }
+
+        await convertRtspToMp4(process.argv[3], process.argv[4]);
     }
     else if (process.argv[2] === 'create-cert-json' && process.argv.length === 5) {
         const key = fs.readFileSync(process.argv[3]).toString();
@@ -191,16 +210,33 @@ async function main() {
 
         const login = await getOrDoLogin(ip);
         const url = `https://${ip}/web/component/script/install/${pkg}`;
-        const response = await axios(Object.assign({
+        const response = await httpFetch({
             method: 'POST',
-            auth: {
-                username: login.username,
-                password: login.token,
-            },
+            headers: basicAuthHeaders(login.username, login.token),
             url,
-        }, axiosConfig));
+            rejectUnauthorized: false,
+            responseType: 'json',
+        });
+        if (response.body.error)
+            throw new Error(response.body.error);
 
-        console.log('install successful. id:', response.data.id);
+        console.log('install successful. id:', response.body.id);
+    }
+    else if (process.argv[2] === 'shell') {
+        console.log = () => { };
+
+        const host = toIpAndPort(process.argv[3] || '127.0.0.1');
+        const login = await getOrDoLogin(host);
+        const sdk = await connectScryptedClient({
+            baseUrl: `https://${host}`,
+            pluginId: '@scrypted/core',
+            username: login.username,
+            password: login.token,
+        });
+
+        const separator = process.argv.indexOf("--");
+        const cmd = separator != -1 ? process.argv.slice(separator + 1) : [];
+        await connectShell(sdk, ...cmd);
     }
     else {
         console.log('usage:');
@@ -213,12 +249,12 @@ async function main() {
         console.log('   npx scrypted command name-or-id[@127.0.0.1[:10443]] method-name [...method-arguments]');
         console.log('   npx scrypted ffplay name-or-id[@127.0.0.1[:10443]] method-name [...method-arguments]');
         console.log('   npx scrypted create-cert-json /path/to/key.pem /path/to/cert.pem');
+        console.log('   npx scrypted shell [127.0.0.1[:10443]] [-- cmd [...cmd-args]]');
         console.log();
         console.log('examples:');
         console.log('   npx scrypted install @scrypted/rtsp');
         console.log('   npx scrypted install @scrypted/rtsp/0.0.51');
         console.log('   npx scrypted install @scrypted/rtsp/0.0.51 192.168.2.100');
-        process.exit(1);
     }
 }
 

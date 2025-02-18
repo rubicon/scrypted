@@ -4,13 +4,19 @@ const stun = require('stun')
 
 const stunMagicCookie = 0x2112a442 // https://tools.ietf.org/html/rfc5389#section-6
 
-export interface RtpStreamOptions {
+export interface SrtpOptions {
+  srtpKey: Buffer
+  srtpSalt: Buffer
+}
+
+export interface RtpStreamOptions extends SrtpOptions {
   port: number
   rtcpPort: number
 }
 
 export interface RtpOptions {
   audio: RtpStreamOptions
+  video: RtpStreamOptions
 }
 
 export interface RtpStreamDescription extends RtpStreamOptions {
@@ -22,6 +28,7 @@ export interface RtpStreamDescription extends RtpStreamOptions {
 export interface RtpDescription {
   address: string
   audio: RtpStreamDescription
+  video: RtpStreamDescription
   sdp: string
 }
 
@@ -52,10 +59,12 @@ export function sendStunBindingRequest({
   rtcpSplitter: dgram.Socket
   rtpDescription: RtpDescription
   localUfrag?: string
-  type: 'video' | 'audio'
+  type: 'audio' | 'video'
 }) {
+  const  remoteDescription = rtpDescription[type];
+  if( remoteDescription.port == 0 )
+    return;
   const message = stun.createMessage(1),
-    remoteDescription = rtpDescription[type],
     { address } = rtpDescription,
     { iceUFrag, icePwd, port, rtcpPort } = remoteDescription
 

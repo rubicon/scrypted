@@ -1,22 +1,20 @@
-import { MediaStreamTrack, PeerConfig, RTCPeerConnection, RtcpRrPacket, RTCRtpCodecParameters, RTCRtpTransceiver, RtpPacket } from "@koush/werift";
+import { MediaStreamTrack, PeerConfig, RTCPeerConnection, RTCRtpCodecParameters, RTCRtpTransceiver, RtpPacket } from "./werift";
 
 import { Deferred } from "@scrypted/common/src/deferred";
-import sdk, { BufferConverter, BufferConvertorOptions, FFmpegInput, FFmpegTranscodeStream, Intercom, MediaObject, MediaStreamDestination, MediaStreamFeedback, RequestMediaStream, RTCAVSignalingSetup, RTCConnectionManagement, RTCMediaObjectTrack, RTCSignalingOptions, RTCSignalingSession, ScryptedDevice, ScryptedDeviceBase, ScryptedMimeTypes } from "@scrypted/sdk";
-import type { WebRTCPlugin } from "./main";
+import sdk, { FFmpegInput, FFmpegTranscodeStream, Intercom, MediaObject, MediaStreamDestination, MediaStreamFeedback, RequestMediaStream, RTCAVSignalingSetup, RTCConnectionManagement, RTCInputMediaObjectTrack, RTCOutputMediaObjectTrack, RTCSignalingOptions, RTCSignalingSession, ScryptedDevice, ScryptedMimeTypes } from "@scrypted/sdk";
 import { ScryptedSessionControl } from "./session-control";
-import { requiredAudioCodecs, requiredVideoCodec } from "./webrtc-required-codecs";
-import { logIsPrivateIceTransport } from "./werift-util";
+import { opusAudioCodecOnly, requiredAudioCodecs, requiredVideoCodec } from "./webrtc-required-codecs";
+import { logIsLocalIceTransport } from "./werift-util";
 
 import { addVideoFilterArguments } from "@scrypted/common/src/ffmpeg-helpers";
-import { connectRTCSignalingClients } from "@scrypted/common/src/rtc-signaling";
+import { connectRTCSignalingClients, legacyGetSignalingSessionOptions } from "@scrypted/common/src/rtc-signaling";
 import { getSpsPps } from "@scrypted/common/src/sdp-utils";
 import { H264Repacketizer } from "../../homekit/src/types/camera/h264-packetizer";
+import { OpusRepacketizer } from "../../homekit/src/types/camera/opus-repacketizer";
 import { logConnectionState, waitClosed, waitConnected, waitIceConnected } from "./peerconnection-util";
 import { RtpCodecCopy, RtpTrack, RtpTracks, startRtpForwarderProcess } from "./rtp-forwarders";
 import { getAudioCodec, getFFmpegRtpAudioOutputArguments } from "./webrtc-required-codecs";
 import { WeriftSignalingSession } from "./werift-signaling-session";
-
-export const RTC_BRIDGE_NATIVE_ID = 'rtc-bridge';
 
 function getDebugModeH264EncoderArgs() {
     return [
@@ -32,35 +30,61 @@ function getDebugModeH264EncoderArgs() {
     ];
 }
 
+const fullResolutionAllowList = [
+    'Windows',
+    'Macintosh',
+    'iPhone',
+    'iPad',
+    'iOS',
+];
+
 export async function createTrackForwarder(options: {
     timeStart: number,
-    isPrivate: boolean, destinationId: string,
+    isLocalNetwork: boolean, destinationId: string, ipv4: boolean, type: string,
     requestMediaStream: RequestMediaStream,
     videoTransceiver: RTCRtpTransceiver, audioTransceiver: RTCRtpTransceiver,
-    sessionSupportsH264High: boolean, maximumCompatibilityMode: boolean, transcodeWidth: number,
+    maximumCompatibilityMode: boolean, clientOptions: RTCSignalingOptions,
 }) {
     const {
         timeStart,
-        isPrivate, destinationId,
+        isLocalNetwork, destinationId, type,
         requestMediaStream,
         videoTransceiver, audioTransceiver,
-        sessionSupportsH264High, maximumCompatibilityMode, transcodeWidth
+        maximumCompatibilityMode,
+        clientOptions,
     } = options;
 
-    const transcodeBaseline = !sessionSupportsH264High || maximumCompatibilityMode;
-    const requestDestination: MediaStreamDestination = transcodeBaseline ? 'medium-resolution' : 'local';
+    const { sessionSupportsH264High, transcodeWidth, isMediumResolution, width, height } = parseOptions(clientOptions);
+
+    let transcodeBaseline = maximumCompatibilityMode;
+    // const transcodeBaseline = !sessionSupportsH264High || maximumCompatibilityMode;
+    const handlesHighResolution = !isMediumResolution && !transcodeBaseline;
+
+    let requestDestination: MediaStreamDestination;
+    if (transcodeBaseline) {
+        requestDestination = 'medium-resolution';
+    }
+    else if (!isLocalNetwork) {
+        requestDestination = 'remote';
+    }
+
     const mo = await requestMediaStream({
         video: {
             codec: 'h264',
+            width,
+            height,
         },
         audio: {
             codec: 'opus',
         },
-        adaptive: !transcodeBaseline,
-        destination: isPrivate ? requestDestination : 'remote',
+        adaptive: handlesHighResolution,
+        destination: requestDestination,
         destinationId,
-        tool: transcodeBaseline ? 'ffmpeg' : 'scrypted',
+        tool: !handlesHighResolution ? 'ffmpeg' : 'scrypted',
     });
+
+    if (!mo)
+        return;
 
     let mediaStreamFeedback: MediaStreamFeedback;
     try {
@@ -74,22 +98,40 @@ export async function createTrackForwarder(options: {
         });
     }
 
-    const console = sdk.deviceManager.getMixinConsole(mo.sourceId, RTC_BRIDGE_NATIVE_ID);
-    if (transcodeBaseline) {
-        console.log('Requesting medium-resolution stream', {
-            sessionSupportsH264High,
-            maximumCompatibilityMode,
-        });
-    }
+    const console = sdk.deviceManager.getMixinConsole(mo.sourceId);
     const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(mo, ScryptedMimeTypes.FFmpegInput);
     const { mediaStreamOptions } = ffmpegInput;
 
+    // this transcode fallback is for low power devices like the echo show that
+    // will crap out if fed a high resolution stream.
+    if (isMediumResolution && !transcodeBaseline) {
+        // don't transcode on cheapo windows laptops with tiny screens
+        // which are capable of handling high resolution streams.
+        // this transcode fallback should only be used on Linux devices.
+        // But it may not report itself as Linux, so do a non-Windows/Mac/iOS check.
+        let found = false;
+        for (const allow of fullResolutionAllowList) {
+            found ||= options?.clientOptions?.userAgent?.includes(allow);
+        }
+        if (!found) {
+            const width = ffmpegInput?.mediaStreamOptions?.video?.width;
+            transcodeBaseline = !width || width > 1280;
+        }
+    }
+
+    console.log('Client Stream Profile', {
+        transcodeBaseline,
+        sessionSupportsH264High,
+        maximumCompatibilityMode,
+        ...clientOptions,
+    });
+
     if (!maximumCompatibilityMode) {
         let found: RTCRtpCodecParameters;
-        if (mediaStreamOptions.audio?.codec === 'pcm_ulaw') {
+        if (mediaStreamOptions?.audio?.codec === 'pcm_mulaw') {
             found = audioTransceiver.codecs.find(codec => codec.mimeType === 'audio/PCMU')
         }
-        else if (mediaStreamOptions.audio?.codec === 'pcm_alaw') {
+        else if (mediaStreamOptions?.audio?.codec === 'pcm_alaw') {
             found = audioTransceiver.codecs.find(codec => codec.mimeType === 'audio/PCMA')
         }
         if (found)
@@ -116,7 +158,7 @@ export async function createTrackForwarder(options: {
     videoTranscodeArguments.push(...(ffmpegInput.h264FilterArguments || []));
 
     if (transcode) {
-        const conservativeDefaultBitrate = isPrivate ? 1000000 : 500000;
+        const conservativeDefaultBitrate = isLocalNetwork ? 1000000 : 500000;
         const bitrate = maximumCompatibilityMode ? conservativeDefaultBitrate : (ffmpegInput.destinationVideoBitrate || conservativeDefaultBitrate);
         videoTranscodeArguments.push(
             // this seems to cause issues with presets i think.
@@ -151,7 +193,7 @@ export async function createTrackForwarder(options: {
         videoTranscodeArguments.push('-vcodec', 'copy')
     }
 
-    const audioTranscodeArguments = getFFmpegRtpAudioOutputArguments(ffmpegInput.mediaStreamOptions?.audio?.codec, audioTransceiver.sender.codec, maximumCompatibilityMode);
+    const audioTranscodeArguments = getFFmpegRtpAudioOutputArguments(ffmpegInput.mediaStreamOptions?.audio, audioTransceiver.sender.codec, maximumCompatibilityMode);
 
     let needPacketization = !!videoCodecCopy;
     if (transcode) {
@@ -172,9 +214,49 @@ export async function createTrackForwarder(options: {
         }
     }
 
+    if (mediaStreamFeedback)
+        needPacketization = false;
+
+    let opusRepacketizer: OpusRepacketizer;
+    let lastPacketTs: number = 0;
     const audioRtpTrack: RtpTrack = {
-        codecCopy: audioCodecCopy,
-        onRtp: buffer => audioTransceiver.sender.sendRtp(buffer),
+        negotiate: async msection => {
+            if (!audioCodecCopy)
+                return false;
+            if (audioCodecCopy === 'copy')
+                return true;
+            if (msection.codec === 'opus')
+                return msection.rtpmap.clock === 48000;
+            if (msection.codec !== 'pcm_mulaw' && msection.codec !== 'pcm_alaw')
+                return false;
+            // alexa doesn't support these though they're required by webrtc spec...
+            if (msection.codec === 'pcm_mulaw' && !audioTransceiver.codecs.find(codec => codec.mimeType === 'audio/PCMU'))
+                return false;
+            if (msection.codec === 'pcm_alaw' && !audioTransceiver.codecs.find(codec => codec.mimeType === 'audio/PCMA'))
+                return false;
+            return msection.rtpmap.clock === 8000;
+        },
+        // codecCopy: audioCodecCopy,
+        onRtp: buffer => {
+            if (false && audioTransceiver.sender.codec.mimeType?.toLowerCase() === "audio/opus") {
+                // this will use 3 20ms frames, 60ms. seems to work up to 6/120ms
+                if (!opusRepacketizer)
+                    opusRepacketizer = new OpusRepacketizer(3);
+                for (const rtp of opusRepacketizer.repacketize(RtpPacket.deSerialize(buffer))) {
+                    audioTransceiver.sender.sendRtp(rtp);
+                }
+            }
+            else {
+                const rtp = RtpPacket.deSerialize(buffer);
+                const now = Date.now();
+                rtp.header.marker = now - lastPacketTs > 1000; // set the marker if it's been more than 1s since the last packet
+                rtp.header.payloadType = audioTransceiver.sender.codec.payloadType;
+                // pcm audio can be concatenated.
+                // hikvision seems to send 40ms duration packets, so 25 packets per second.
+                audioTransceiver.sender.sendRtp(rtp.serialize());
+                lastPacketTs = now;
+            }
+        },
         encoderArguments: [
             ...audioTranscodeArguments,
         ],
@@ -184,7 +266,35 @@ export async function createTrackForwarder(options: {
         },
     };
 
-    const videoPacketSize = 1300;
+    // ipv4 mtu is 1500
+    // so max usable packet size is 1500 - tcp header - ip header
+    // 1500 - 20 - 20 = 1460.
+    // but set to 1440 just to be safe.
+    // 1/9/2023: bug report from eweber discovered that usable MTU on tmobile is 1424.
+    // additional consideration should be given whether to always enforce ipv6 mtu on
+    // non-local destination?
+    // const videoPacketSize = options.ipv4 ? 1424 : 1300;
+    // 1/9/2023:
+    // 1378 is what homekit requests, regardless of local or remote network.
+    // so setting 1378 as the fixed value seems wise, given apple probably has
+    // better knowledge of network capabilities, and also mirrors
+    // from my cursory research into ipv6, the MTU is no lesser than ipv4, in fact
+    // the min mtu is larger.
+    // 2024/06/20: webrtc MTU is typically 1200 as seen in chrome:
+    // https://groups.google.com/g/discuss-webrtc/c/gH5ysR3SoZI
+    // https://bloggeek.me/webrtcglossary/mtu-size/
+    // apparently this is due to guaranteeing reliability for weird networks.
+    // most of these networks can be correctly configured with an increased MTU (wireguard, tailscale),
+    // but others can not, like iCloud Private Relay.
+    // iCloud Private Relay ends up coming through TURN, as do many other restrictive networks.
+    // so when a turn (aka relay) server is used, a smaller MTU must be used. Otherwise optimistically use
+    // the normal/larger default.
+    // After a bit of fiddling with iCloud Private Relay, 1246 was arrived at as the optimal value.
+    // 2024/06/28: Setting to 1200 due to FirstNet.
+    // After further user testing, FirstNet MTU seems be around 1200, though advertised at 1342.
+    // So using Chrome's 1200 seems best, though crappy.
+    // https://iotdevices.att.com/att-iot/FirstNetMTU.aspx
+    const videoPacketSize = 1200;
     let h264Repacketizer: H264Repacketizer;
     let spsPps: ReturnType<typeof getSpsPps>;
 
@@ -193,20 +303,30 @@ export async function createTrackForwarder(options: {
         packetSize: videoPacketSize,
         onMSection: (videoSection) => spsPps = getSpsPps(videoSection),
         onRtp: (buffer) => {
+            let onRtp: (rtp: Buffer) => void;
+
             if (needPacketization) {
                 if (!h264Repacketizer) {
-                    h264Repacketizer = new H264Repacketizer(console, videoPacketSize, {
+                    // adjust packet size for the rtp packet header (12).
+                    h264Repacketizer = new H264Repacketizer(console, videoPacketSize - 12, {
                         ...spsPps,
                     });
                 }
-                const repacketized = h264Repacketizer.repacketize(RtpPacket.deSerialize(buffer));
-                for (const packet of repacketized) {
-                    videoTransceiver.sender.sendRtp(packet);
-                }
+                onRtp = buffer => {
+                    const repacketized = h264Repacketizer.repacketize(RtpPacket.deSerialize(buffer));
+                    for (const packet of repacketized) {
+                        videoTransceiver.sender.sendRtp(packet);
+                    }
+                };
             }
             else {
-                videoTransceiver.sender.sendRtp(buffer);
+                onRtp = buffer => {
+                    videoTransceiver.sender.sendRtp(buffer);
+                };
             }
+
+            videoRtpTrack.onRtp = onRtp;
+            videoRtpTrack.onRtp(buffer);
         },
         encoderArguments: [
             ...videoTranscodeArguments,
@@ -219,9 +339,14 @@ export async function createTrackForwarder(options: {
     };
 
     let tracks: RtpTracks;
-    if (ffmpegInput.mediaStreamOptions?.audio === null) {
+    if (ffmpegInput.mediaStreamOptions?.audio === null || !audioTransceiver) {
         tracks = {
             video: videoRtpTrack,
+        }
+    }
+    else if (ffmpegInput.mediaStreamOptions?.video === null || !videoTransceiver) {
+        tracks = {
+            audio: audioRtpTrack,
         }
     }
     else {
@@ -268,24 +393,44 @@ export function parseOptions(options: RTCSignalingOptions) {
             }
             return false;
         });
-    const transcodeWidth = Math.max(640, Math.min(options?.screen?.width || 960, 1280));
+
 
     // firefox is misleading. special case that to disable transcoding.
     if (options?.userAgent?.includes('Firefox/'))
         sessionSupportsH264High = true;
 
+    const transcodeWidth = Math.max(640, Math.min(options?.screen?.width || 960, 1280));
+    const devicePixelRatio = options?.screen?.devicePixelRatio || 1;
+    const width = (options?.screen?.width * devicePixelRatio) || undefined;
+    const height = (options?.screen?.height * devicePixelRatio) || undefined;
+    const max = Math.max(width, height);
+    const isMediumResolution = !sessionSupportsH264High || (max && max < 1920);
+
     return {
         sessionSupportsH264High,
         transcodeWidth,
+        isMediumResolution,
+        width: isMediumResolution ? 1280 : width,
+        height: isMediumResolution ? 720 : height,
     };
 }
 
-class WebRTCTrack implements RTCMediaObjectTrack {
+class WebRTCTrack implements RTCOutputMediaObjectTrack, RTCInputMediaObjectTrack {
     control: ScryptedSessionControl;
     removed = new Deferred<void>();
 
     constructor(public connectionManagement: WebRTCConnectionManagement, public video: RTCRtpTransceiver, public audio: RTCRtpTransceiver, intercom: Intercom) {
         this.control = new ScryptedSessionControl(intercom, audio);
+        this.connectionManagement.activeTracks.add(this);
+    }
+
+    async onStop(): Promise<void> {
+        return this.removed.promise;
+    }
+
+    attachForwarder(f: Awaited<ReturnType<typeof createTrackForwarder>>) {
+        const stopped = this.removed;
+        f.killPromise.then(() => stopped.resolve(undefined)).catch(e => stopped.reject(e));
     }
 
     async replace(mediaObject: MediaObject): Promise<void> {
@@ -297,6 +442,7 @@ class WebRTCTrack implements RTCMediaObjectTrack {
         this.control = new ScryptedSessionControl(intercom, this.audio);
 
         const f = await createTrackForwarder(this.video, this.audio);
+        this.attachForwarder(f);
         waitClosed(this.connectionManagement.pc).finally(() => f.kill());
         this.removed.promise.finally(() => f.kill());
     }
@@ -305,7 +451,7 @@ class WebRTCTrack implements RTCMediaObjectTrack {
         if (this.removed.finished)
             return;
         this.removed.resolve(undefined);
-        this.control.killed.resolve(undefined);
+        this.control.endSession();
         this.video.sender.onRtcp.allUnsubscribe();
 
         if (cleanupTrackOnly)
@@ -322,8 +468,8 @@ class WebRTCTrack implements RTCMediaObjectTrack {
         return this.cleanup(false);
     }
 
-    setPlayback(options: { audio: boolean; video: boolean; }): Promise<void> {
-        return this.control.setPlayback(options);
+    setPlayback(options: { audio: boolean; video: boolean; }): Promise<MediaObject> {
+        return this.control.setPlaybackInternal(options);
     }
 }
 
@@ -334,11 +480,13 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
     activeTracks = new Set<WebRTCTrack>();
     closed = false;
 
-    constructor(public console: Console, public clientSession: RTCSignalingSession, public maximumCompatibilityMode: boolean, public transcodeWidth: number,
-        public sessionSupportsH264High: boolean,
+    constructor(public console: Console, public clientSession: RTCSignalingSession,
+        public requireOpus: boolean,
+        public maximumCompatibilityMode: boolean,
+        public clientOptions: RTCSignalingOptions,
         public options: {
             configuration: RTCConfiguration,
-            weriftConfiguration: PeerConfig,
+            weriftConfiguration: Partial<PeerConfig>,
         }) {
 
         this.pc = new RTCPeerConnection({
@@ -347,7 +495,7 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
             // the cameras and alexa targets will also provide externally reachable addresses.
             codecs: {
                 audio: [
-                    ...requiredAudioCodecs,
+                    ...(requireOpus ? opusAudioCodecOnly : requiredAudioCodecs),
                 ],
                 video: [
                     requiredVideoCodec,
@@ -356,12 +504,13 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
             ...options.weriftConfiguration,
         });
         logConnectionState(console, this.pc);
-
-        this.pc.signalingStateChange.subscribe(() => {
-            this.console.log('sig change', this.pc.signalingState);
-        })
+        waitConnected(this.pc)
+            .then(() => logIsLocalIceTransport(this.console, this.pc)).catch(() => { });
 
         this.weriftSignalingSession = new WeriftSignalingSession(console, this.pc);
+    }
+
+    async probe() {
     }
 
     async createTracks(mediaObject: MediaObject, intercomId?: string) {
@@ -381,23 +530,26 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
         });
 
         const atrack = new MediaStreamTrack({ kind: "audio" });
+        const console = sdk.deviceManager.getMixinConsole(mediaObject?.sourceId || intercomId);
 
         const timeStart = Date.now();
+
         return {
             vtrack,
             atrack,
             intercom,
-            createTrackForwarder: (videoTransceiver: RTCRtpTransceiver, audioTransceiver: RTCRtpTransceiver) =>
-                createTrackForwarder({
+            createTrackForwarder: async (videoTransceiver: RTCRtpTransceiver, audioTransceiver: RTCRtpTransceiver) => {
+                const ret = await createTrackForwarder({
                     timeStart,
-                    ...logIsPrivateIceTransport(this.console, this.pc),
+                    ...logIsLocalIceTransport(console, this.pc),
                     requestMediaStream,
                     videoTransceiver,
                     audioTransceiver,
-                    sessionSupportsH264High: this.sessionSupportsH264High,
                     maximumCompatibilityMode: this.maximumCompatibilityMode,
-                    transcodeWidth: this.transcodeWidth,
-                }),
+                    clientOptions: this.clientOptions,
+                });
+                return ret;
+            },
         }
     }
 
@@ -435,9 +587,16 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
         }
     }
 
+    addInputTrack(options: { videoMid?: string; audioMid?: string; }): Promise<RTCInputMediaObjectTrack> {
+        throw new Error('not implemented');
+    }
+
     async addTrack(mediaObject: MediaObject, options?: {
         videoMid?: string,
         audioMid?: string,
+        /**
+         * @deprecated
+         */
         intercomId?: string,
     }) {
         const { atrack, vtrack, createTrackForwarder, intercom } = await this.createTracks(mediaObject, options?.intercomId);
@@ -456,17 +615,24 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
         const ret = new WebRTCTrack(this, videoTransceiver, audioTransceiver, intercom);
 
         this.negotiation.then(async () => {
-            this.console.log('waiting ice connected');
-            if (this.pc.remoteIsBundled)
-                await waitConnected(this.pc);
-            else
-                await waitIceConnected(this.pc);
-            if (ret.removed.finished)
-                return;
-            this.console.log('done waiting ice connected');
-            const f = await createTrackForwarder(videoTransceiver, audioTransceiver);
-            waitClosed(this.pc).finally(() => f.kill());
-            ret.removed.promise.finally(() => f.kill());
+            try {
+                this.console.log('waiting ice connected');
+                if (this.pc.remoteIsBundled)
+                    await waitConnected(this.pc);
+                else
+                    await waitIceConnected(this.pc);
+                if (ret.removed.finished)
+                    return;
+                this.console.log('done waiting ice connected');
+                const f = await createTrackForwarder(videoTransceiver, audioTransceiver);
+                ret.attachForwarder(f);
+                waitClosed(this.pc).finally(() => f?.kill());
+                ret.removed.promise.finally(() => f?.kill());
+            }
+            catch (e) {
+                this.console.error('Error starting playback for WebRTC track.', e);
+                ret.cleanup(false);
+            }
         });
 
         return ret;
@@ -474,7 +640,7 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
 
     async close(): Promise<void> {
         for (const track of this.activeTracks) {
-            track.cleanup(true);
+            track.cleanup(false);
         }
         this.activeTracks.clear();
         this.pc.close();
@@ -483,31 +649,10 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
     async waitClosed() {
         await waitClosed(this.pc);
     }
-}
 
-export class WebRTCBridge extends ScryptedDeviceBase implements BufferConverter {
-    constructor(public plugin: WebRTCPlugin, nativeId: string) {
-        super(nativeId);
-
-        this.fromMimeType = ScryptedMimeTypes.RTCSignalingSession;
-        this.toMimeType = ScryptedMimeTypes.RTCConnectionManagement;
-    }
-
-    async convert(data: any, fromMimeType: string, toMimeType: string, options?: BufferConvertorOptions): Promise<any> {
-        const session = data as RTCSignalingSession;
-        const maximumCompatibilityMode = !!this.plugin.storageSettings.values.maximumCompatibilityMode;
-        const { transcodeWidth, sessionSupportsH264High } = parseOptions(await session.getOptions());
-
-        const console = sdk.deviceManager.getMixinConsole(options?.sourceId, this.nativeId);
-        const ret = new WebRTCConnectionManagement(console, session, maximumCompatibilityMode, transcodeWidth, sessionSupportsH264High, {
-            configuration: this.plugin.getRTCConfiguration(),
-            weriftConfiguration: this.plugin.getWeriftConfiguration(),
-        });
-        // todo: move this into api, provide a client stream.
-        ret.pc.createDataChannel('dummy');
-        const offer = await ret.pc.createOffer();
-        ret.pc.setLocalDescription(offer);
-        return ret;
+    async waitConnected() {
+        await waitIceConnected(this.pc);
+        await waitConnected(this.pc);
     }
 }
 
@@ -516,13 +661,16 @@ export async function createRTCPeerConnectionSink(
     console: Console,
     intercom: ScryptedDevice & Intercom,
     mo: MediaObject,
+    requireOpus: boolean,
     maximumCompatibilityMode: boolean,
     configuration: RTCConfiguration,
-    weriftConfiguration: PeerConfig,
+    weriftConfiguration: Partial<PeerConfig>,
+    clientOffer = true,
 ) {
-    const { transcodeWidth, sessionSupportsH264High } = parseOptions(await clientSignalingSession.getOptions());
+    const clientOptions = await legacyGetSignalingSessionOptions(clientSignalingSession);
+    // console.log('remote options', clientOptions);
 
-    const connection = new WebRTCConnectionManagement(console, clientSignalingSession, maximumCompatibilityMode, transcodeWidth, sessionSupportsH264High, {
+    const connection = new WebRTCConnectionManagement(console, clientSignalingSession, requireOpus, maximumCompatibilityMode, clientOptions, {
         configuration,
         weriftConfiguration,
     });
@@ -532,7 +680,7 @@ export async function createRTCPeerConnectionSink(
     });
 
     track.control.killed.promise.then(() => {
-        track.cleanup(true);
+        track.cleanup(false);
         connection.pc.close();
     });
 
@@ -546,7 +694,7 @@ export async function createRTCPeerConnectionSink(
         configuration,
     };
 
-    connection.negotiateRTCSignalingSessionInternal(setup, true);
+    connection.negotiateRTCSignalingSessionInternal(setup, clientOffer);
 
     return track.control;
 }

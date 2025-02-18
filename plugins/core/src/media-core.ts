@@ -3,7 +3,9 @@ import { ScryptedDeviceBase, DeviceProvider, ScryptedInterface, ScryptedDeviceTy
 import sdk from '@scrypted/sdk';
 const { systemManager, deviceManager, mediaManager, endpointManager } = sdk;
 import { RequestMediaObjectHost, FileHost, BufferHost } from './converters';
+import url from 'url';
 
+export const MediaCoreNativeId = 'mediacore';
 export class MediaCore extends ScryptedDeviceBase implements DeviceProvider, BufferConverter, HttpRequestHandler {
     httpHost: BufferHost;
     httpsHost: BufferHost;
@@ -11,10 +13,10 @@ export class MediaCore extends ScryptedDeviceBase implements DeviceProvider, Buf
     fileHost: FileHost;
     filesHost: FileHost;
 
-    constructor(nativeId: string) {
-        super(nativeId);
+    constructor() {
+        super(MediaCoreNativeId);
 
-        this.fromMimeType = ScryptedMimeTypes.SchemePrefix + 'scrypted-media';
+        this.fromMimeType = ScryptedMimeTypes.SchemePrefix + 'scrypted-media' + ';converter-weight=2';
         this.toMimeType = ScryptedMimeTypes.MediaObject;
 
         (async () => {
@@ -102,8 +104,8 @@ export class MediaCore extends ScryptedDeviceBase implements DeviceProvider, Buf
 
     async getLocalSnapshot(id: string, iface: string, search: string) {
         const endpoint = await endpointManager.getAuthenticatedPath(this.nativeId);
-        const url = path.join(endpoint, id, iface, `${Date.now()}.jpg`) + `${search}`;
-        return mediaManager.createMediaObject(Buffer.from(url), ScryptedMimeTypes.LocalUrl);
+        const ret = url.resolve(path.join(endpoint, id, iface, `${Date.now()}.jpg`) + `${search}`, '');
+        return mediaManager.createMediaObject(Buffer.from(ret), ScryptedMimeTypes.LocalUrl);
     }
 
     async convert(data: string, fromMimeType: string, toMimeType: string): Promise<MediaObject> {
@@ -136,5 +138,8 @@ export class MediaCore extends ScryptedDeviceBase implements DeviceProvider, Buf
             return this.fileHost;
         if (nativeId === 'files')
             return this.filesHost;
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
     }
 }

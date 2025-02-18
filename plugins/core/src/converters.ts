@@ -1,8 +1,6 @@
-import { BufferConverter, BufferConvertorOptions, HttpRequest, HttpRequestHandler, HttpResponse, HttpResponseOptions, MediaObject, RequestMediaObject, ScryptedDeviceBase, ScryptedMimeTypes } from "@scrypted/sdk";
-import sdk from "@scrypted/sdk";
-import mime from "mime/lite";
-import path from 'path';
+import sdk, { BufferConverter, HttpRequest, HttpRequestHandler, HttpResponse, HttpResponseOptions, MediaObject, RequestMediaObject, ScryptedDeviceBase, ScryptedMimeTypes } from "@scrypted/sdk";
 import crypto from 'crypto';
+import path from 'path';
 
 const { endpointManager } = sdk;
 
@@ -48,11 +46,13 @@ export class BufferHost extends ScryptedDeviceBase implements HttpRequestHandler
             options.headers['Content-Disposition'] = 'attachment';
         }
 
-        response.send(file.data as Buffer, );
+        response.send(file.data as Buffer,);
     }
 
     async convert(buffer: string, fromMimeType: string, toMimeType: string): Promise<Buffer> {
         const uuid = uuidv4();
+
+        const { default: mime } = await import('mime');
 
         const endpoint = await (this.secure ? endpointManager.getPublicLocalEndpoint(this.nativeId) : endpointManager.getInsecurePublicLocalEndpoint(this.nativeId));
         const extension = mime.getExtension(fromMimeType);
@@ -60,6 +60,7 @@ export class BufferHost extends ScryptedDeviceBase implements HttpRequestHandler
         const filename = uuid + (extension ? `.${extension}` : '');
 
         this.hosted.set(`/${filename}`, { data: buffer, fromMimeType, toMimeType });
+        setTimeout(() => this.hosted.delete(`/${filename}`), 10 * 60 * 1000); // free this resource after 10 min.
 
         return Buffer.from(`${endpoint}${filename}`);
     }
@@ -132,6 +133,7 @@ export class RequestMediaObjectHost extends ScryptedDeviceBase implements HttpRe
         const endpoint = await (toMimeType === ScryptedMimeTypes.LocalUrl ? endpointManager.getPublicLocalEndpoint(this.nativeId) : endpointManager.getInsecurePublicLocalEndpoint(this.nativeId));
         const data = await request();
         fromMimeType = data.mimeType;
+        const { default: mime } = await import('mime');
         const extension = mime.getExtension(fromMimeType);
 
         const filename = uuid + (extension ? `.${extension}` : '');

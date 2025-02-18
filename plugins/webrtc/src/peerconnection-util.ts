@@ -1,4 +1,4 @@
-import { RTCPeerConnection } from "@koush/werift";
+import { RTCPeerConnection } from "./werift";
 
 interface Event {
     subscribe: (execute: () => void) => {
@@ -28,8 +28,8 @@ async function statePromise(e: Event, check: () => boolean): Promise<void> {
 
 function isPeerConnectionClosed(pc: RTCPeerConnection) {
     return (pc.connectionState === 'closed'
-    || pc.connectionState === 'disconnected'
-    || pc.connectionState === 'failed')
+        || pc.connectionState === 'disconnected'
+        || pc.connectionState === 'failed')
 }
 
 export function waitConnected(pc: RTCPeerConnection) {
@@ -42,8 +42,8 @@ export function waitConnected(pc: RTCPeerConnection) {
 
 function isPeerIceConnectionClosed(pc: RTCPeerConnection) {
     return (pc.iceConnectionState === 'disconnected'
-    || pc.iceConnectionState === 'failed'
-    || pc.iceConnectionState === 'closed')
+        || pc.iceConnectionState === 'failed'
+        || pc.iceConnectionState === 'closed')
 }
 
 export function waitIceConnected(pc: RTCPeerConnection) {
@@ -55,9 +55,13 @@ export function waitIceConnected(pc: RTCPeerConnection) {
 }
 
 export function waitClosed(pc: RTCPeerConnection) {
-    return statePromise(pc.connectionStateChange, () => {
-        return isPeerConnectionClosed(pc) || isPeerIceConnectionClosed(pc);
-    })
+    const connectPromise = statePromise(pc.connectionStateChange, () => {
+        return isPeerConnectionClosed(pc);
+    });
+    const iceConnectPromise = statePromise(pc.iceConnectionStateChange, () => {
+        return isPeerIceConnectionClosed(pc);
+    });
+    return Promise.any([connectPromise, iceConnectPromise]);
 }
 
 export function logConnectionState(console: Console, pc: RTCPeerConnection) {

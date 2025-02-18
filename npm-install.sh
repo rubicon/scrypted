@@ -1,3 +1,4 @@
+#!/bin/bash
 echo ######################################
 echo "Setting up popular plugins."
 echo "Additional will need npm install manually."
@@ -8,11 +9,11 @@ cd $(dirname $0)
 git submodule init
 git submodule update
 
-for directory in sdk common server
+for directory in sdk server common packages/client packages/auth-fetch
 do
-    echo "$directory > npm ci"
+    echo "$directory > npm install"
     pushd $directory
-    npm ci
+    npm install
     popd
 done
 
@@ -21,22 +22,15 @@ echo "sdk > npm run build"
 npm run build
 popd
 
-pushd external/HAP-NodeJS
-echo "external/HAP-NodeJS > npm ci"
-npm ci
-echo "external/HAP-NodeJS > npm run build"
-npm run build
-popd
-
 pushd external/werift
 echo "external/werift > npm install"
 npm install
 popd
 
-for directory in ffmpeg-camera rtsp amcrest onvif hikvision unifi-protect homekit
+for directory in rtsp ffmpeg-camera amcrest onvif hikvision reolink unifi-protect webrtc homekit
 do
-    echo "$directory > npm ci"
+    echo "$directory > npm install"
     pushd plugins/$directory
-    npm ci
+    npm install
     popd
 done

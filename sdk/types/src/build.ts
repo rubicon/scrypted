@@ -1,44 +1,56 @@
-import stringifyObject from 'stringify-object';
-import { ScryptedInterface, ScryptedInterfaceDescriptor } from "./types.input";
-import path from 'path';
 import fs from "fs";
+import path from 'path';
+import { ArrayType, DeclarationReflection, InferredType, LiteralType, ProjectReflection, ReferenceType, ReflectionKind, SomeType, Type } from 'typedoc';
+import { ScryptedInterface, ScryptedInterfaceDescriptor } from "./types.input";
 
-const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '../gen/schema.json')).toString());
-const typesVersion = JSON.parse(fs.readFileSync(path.join(__dirname, '../package.json')).toString()).version;
+const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '../gen/schema.json')).toString()) as ProjectReflection;
+const packageJson = require('../package.json');
+const typesVersion = packageJson.version;
 const ScryptedInterfaceDescriptors: { [scryptedInterface: string]: ScryptedInterfaceDescriptor } = {};
 
-const allProperties: { [property: string]: any } = {};
+const allProperties: { [property: string]: DeclarationReflection } = {};
 
-function toTypescriptType(type: any): string {
+function toTypescriptType(type: SomeType ): string {
+    if (type.type === 'literal')
+        return `'${type.value}'`;
     if (type.type === 'array')
         return `${toTypescriptType(type.elementType)}[]`;
-    return type.name;
+    if (type.type === 'union')
+        return type.types.map((type: any) => toTypescriptType(type)).join(' | ')
+    if (type.type === 'reference') {
+        if (type.typeArguments)
+            return `${type.name}<${type.typeArguments.map((t: any) => toTypescriptType(t)).join(', ')}>`;
+        return type.name;
+    }
+    return (type as any).name;
 }
 
 for (const name of Object.values(ScryptedInterface)) {
-    const td = schema.children.find((child: any) => child.name === name);
-    const properties = td.children.filter((child: any) => child.kindString === 'Property').map((child: any) => child.name);
-    const methods = td.children.filter((child: any) => child.kindString === 'Method').map((child: any) => child.name);
+    const td = schema.children?.find((child) => child.name === name);
+    const children = td?.children || [];
+    const properties = children.filter((child) => child.kind === ReflectionKind.Property).map((child) => child.name);
+    const methods = children.filter((child) => child.kind === ReflectionKind.Method).map((child) => child.name);
     ScryptedInterfaceDescriptors[name] = {
         name,
         methods,
         properties,
     };
 
-    for (const p of td.children.filter((child: any) => child.kindString === 'Property')) {
-        allProperties[p.name] = p.type;
+    for (const p of children.filter((child) => child.kind === ReflectionKind.Property)) {
+        allProperties[p.name] = p;
     }
 }
 
 const properties = Object.values(ScryptedInterfaceDescriptors).map(d => d.properties).flat();
+const methods = Object.values(ScryptedInterfaceDescriptors).map(d => d.methods).flat();
 
 const deviceStateContents = `
 export interface DeviceState {
-${Object.entries(allProperties).map(([property, type]) => `  ${property}?: ${toTypescriptType(type)}`).join('\n')}
+${Object.entries(allProperties).map(([property, { type, flags }]) => `  ${property}${flags.isOptional ? '?' : ''}: ${toTypescriptType(type!)}`).join('\n')};
 }
 
 export class DeviceBase implements DeviceState {
-${Object.entries(allProperties).map(([property, type]) => `  ${property}?: ${toTypescriptType(type)}`).join('\n')}
+${Object.entries(allProperties).map(([property, { type, flags }]) => `  ${property}${flags.isOptional ? '?' : '!'}: ${toTypescriptType(type!)}`).join('\n')};
 }
 `;
 
@@ -48,13 +60,20 @@ ${properties.map(property => '  ' + property + ' = \"' + property + '",\n').join
 }
 `;
 
+const methodContents = `
+export enum ScryptedInterfaceMethod {
+${methods.map(method => '  ' + method + ' = \"' + method + '",\n').join('')}
+}
+`;
+
 const contents = `
 export const TYPES_VERSION = "${typesVersion}";
 
 ${deviceStateContents}
 ${propertyContents}
+${methodContents}
 
-export const ScryptedInterfaceDescriptors: { [scryptedInterface: string]: ScryptedInterfaceDescriptor } = ${stringifyObject(ScryptedInterfaceDescriptors, { indent: '  ' })}
+export const ScryptedInterfaceDescriptors: { [scryptedInterface: string]: ScryptedInterfaceDescriptor } = ${JSON.stringify(ScryptedInterfaceDescriptors, undefined, 2)};
 
 ${fs.readFileSync(path.join(__dirname, './types.input.ts'))}
 `;
@@ -64,14 +83,27 @@ fs.writeFileSync(path.join(__dirname, '../gen/index.ts'), contents);
 const discoveredTypes = new Set<string>();
 discoveredTypes.add('EventDetails');
 
+// When computing method signatures, we push the generic parameter types
+// into this set. We can then convert them to Any.
+// Pop the types off when we're done.
+const parameterTypes = new Set<string>();
+
 function toPythonType(type: any): string {
     if (type.type === 'array')
         return `list[${toPythonType(type.elementType)}]`;
+    if (type.type === 'intersection')
+        return `Union[${type.types.map((et: any) => toPythonType(et)).join(', ')}]`
     if (type.type === 'tuple')
         return `tuple[${type.elements.map((et: any) => toPythonType(et)).join(', ')}]`;
     if (type.type === 'union')
         return type.types.map((type: any) => toPythonType(type)).join(' | ')
+    if (type.name === 'AsyncGenerator')
+        return `AsyncGenerator[${toPythonType(type.typeArguments[0])}, None]`;
+    if (type.name === 'Record')
+        return `Mapping[${toPythonType(type.typeArguments[0])}, ${toPythonType(type.typeArguments[1])}]`;
     type = type.typeArguments?.[0]?.name || type.name || type;
+    if (parameterTypes.has(type))
+        return 'Any';
     switch (type) {
         case 'boolean':
             return 'bool';
@@ -121,12 +153,18 @@ function selfSignature(method: any) {
     return params.join(', ');
 }
 
-const enums = schema.children.filter((child: any) => child.kindString === 'Enumeration');
-const interfaces = schema.children.filter((child: any) => Object.values(ScryptedInterface).includes(child.name));
-let python = '';
+const enums = schema.children?.filter((child) => child.kind === ReflectionKind.Enum) ?? [];
+const interfaces = schema.children?.filter((child: any) => Object.values(ScryptedInterface).includes(child.name)) ?? [];
+let python = `
+TYPES_VERSION = "${typesVersion}"
 
-for (const iface of ['Logger', 'DeviceManager', 'SystemManager', 'MediaManager', 'EndpointManager']) {
-    interfaces.push(schema.children.find((child: any) => child.name === iface));
+`;
+
+for (const iface of ['Logger', 'DeviceManager', 'SystemManager', 'MediaManager', 'EndpointManager', 'ClusterManager']) {
+    const child = schema.children?.find((child: any) => child.name === iface);
+
+    if (child)
+        interfaces.push(child);
 }
 
 let seen = new Set<string>();
@@ -137,25 +175,75 @@ seen.add('RTCSignalingSession');
 seen.add('RTCSignalingChannel');
 seen.add('RTCSignalingClient');
 
-function addNonDictionaryType(td: any) {
+function toDocstring(td: any, includePass: boolean = false) {
+    const suffix = includePass ? `    pass` : '';
+    const comments: any[] = ((td.comment ?? {}).summary ?? []).filter((item: any) => item.kind === "text");
+    if (comments.length === 0) {
+        if (includePass) {
+            return `pass`;
+        }
+        return '';
+    }
+    if (comments.length === 1) {
+        return `    """${comments[0].text.replaceAll('\n', ' ')}"""\n${suffix}`;
+    }
+    let text = `    """\n`;
+    for (const comment of comments) {
+        text += `    ${comment.text.replaceAll('\n', ' ')}\n\n`;
+    }
+    text = text.slice(0, text.length - 2)
+    text += `    """\n${suffix}`;
+    return text
+
+}
+
+function toComment(td: any) {
+    const comments: any[] = ((td.comment ?? {}).summary ?? []).filter((item: any) => item.kind === "text");
+    if (comments.length === 0) {
+        return '';
+    }
+    if (comments.length === 1) {
+        return `  # ${comments[0].text.replaceAll('\n', ' ')}`;
+    }
+    let text = `  # `;
+    for (const comment of comments) {
+        text += `${comment.text.replaceAll('\n', ' ')} `;
+    }
+    return text.slice(0, text.length - 1)
+
+}
+
+function addNonDictionaryType(td: DeclarationReflection) {
     seen.add(td.name);
     python += `
 class ${td.name}:
+${toDocstring(td)}
 `;
+    // cache type parameters so underlying generators can map them to Any
+    for (const typeParameter of td.typeParameters || []) {
+        parameterTypes.add(typeParameter.name);
+    }
 
-    const properties = td.children.filter((child: any) => child.kindString === 'Property');
-    const methods = td.children.filter((child: any) => child.kindString === 'Method');
+    const children = td.children || [];
+    const properties = children.filter((child) => child.kind === ReflectionKind.Property);
+    const methods = children.filter((child) => child.kind === ReflectionKind.Method);
     for (const property of properties) {
-        python += `    ${property.name}: ${toPythonType(property.type)}
+        python += `    ${property.name}: ${toPythonType(property.type)}${toComment(property)}
 `
     }
     for (const method of methods) {
-        python += `    ${toPythonMethodDeclaration(method)} ${method.name}(${selfSignature(method)}) -> ${toPythonReturnType(method.signatures[0].type)}:
-        pass
+        python += `    ${toPythonMethodDeclaration(method)} ${method.name}(${selfSignature(method)}) -> ${toPythonReturnType(method.signatures![0].type)}:
+        ${toDocstring(method, true)}
+
 `
     }
-    python += `    pass
-`;
+    if (!td.children)
+        python += `
+    pass
+`
+
+    // reset for the next type
+    parameterTypes.clear();
 }
 
 for (const td of interfaces) {
@@ -166,17 +254,21 @@ for (const td of interfaces) {
 
 let pythonEnums = ''
 for (const e of enums) {
-    pythonEnums += `
-class ${e.name}(Enum):
+    if (e.children) {
+        pythonEnums += `
+class ${e.name}(str, Enum):
+${toDocstring(e)}
 `
-    for (const val of e.children) {
-        pythonEnums += `    ${val.name} = "${val.type.value}"
+        for (const val of e.children) {
+            if (val.type && 'value' in val.type)
+                pythonEnums += `    ${val.name} = "${val.type.value}"
 `;
+        }
     }
 }
 
 python += `
-class ScryptedInterfaceProperty(Enum):
+class ScryptedInterfaceProperty(str, Enum):
 `
 for (const val of properties) {
     python += `    ${val} = "${val}"
@@ -184,19 +276,31 @@ for (const val of properties) {
 }
 
 python += `
+class ScryptedInterfaceMethods(str, Enum):
+`
+for (const val of methods) {
+    python += `    ${val} = "${val}"
+`;
+}
+
+python += `
 class DeviceState:
+
     def getScryptedProperty(self, property: str) -> Any:
         pass
+
     def setScryptedProperty(self, property: str, value: Any):
         pass
+
 `
-for (const [val, type] of Object.entries(allProperties)) {
+for (const [val, { type }] of Object.entries(allProperties)) {
     if (val === 'nativeId')
         continue;
     python += `
     @property
     def ${val}(self) -> ${toPythonType(type)}:
         return self.getScryptedProperty("${val}")
+
     @${val}.setter
     def ${val}(self, value: ${toPythonType(type)}):
         self.setScryptedProperty("${val}", value)
@@ -208,7 +312,7 @@ ScryptedInterfaceDescriptors = ${JSON.stringify(ScryptedInterfaceDescriptors, nu
 `
 
 while (discoveredTypes.size) {
-    const unknowns = schema.children.filter((child: any) => discoveredTypes.has(child.name) && !enums.find((e: any) => e.name === child.name));
+    const unknowns = schema.children?.filter((child: any) => discoveredTypes.has(child.name) && !enums.find((e: any) => e.name === child.name)) ?? [];
 
     const newSeen = new Set([...seen, ...discoveredTypes]);
     discoveredTypes.clear();
@@ -220,22 +324,26 @@ while (discoveredTypes.size) {
             continue;
         if (td.name === 'EventListener' || td.name === 'SettingValue')
             continue;
-        const isDictionary = !td.children?.find((c: any) => c.kindString === 'Method');
+        const isDictionary = !td.children?.find((c) => c.kind === ReflectionKind.Method);
         if (!isDictionary) {
             addNonDictionaryType(td);
             continue;
         }
         pythonUnknowns += `
 class ${td.name}(TypedDict):
+${toDocstring(td)}
 `;
 
-        const properties = td.children?.filter((child: any) => child.kindString === 'Property') || [];
+        const properties = td.children?.filter((child) => child.kind === ReflectionKind.Property) || [];
         for (const property of properties) {
-            pythonUnknowns += `    ${property.name}: ${toPythonType(property.type)}
+            pythonUnknowns += `    ${property.name}: ${toPythonType(property.type)}${toComment(property)}
 `
         }
-        pythonUnknowns += `    pass
+        if (properties.length === 0) {
+            pythonUnknowns += `    pass
+
 `;
+        }
     }
 
     python = pythonUnknowns + python;
@@ -244,9 +352,11 @@ class ${td.name}(TypedDict):
 
 const pythonTypes = `from __future__ import annotations
 from enum import Enum
-from typing_extensions import TypedDict
-from typing import Any
-from typing import Callable
+try:
+    from typing import TypedDict, Mapping
+except:
+    from typing_extensions import TypedDict, Mapping
+from typing import Union, Any, AsyncGenerator
 
 from .other import *
 

@@ -2,15 +2,42 @@ from __future__ import annotations
 from .types import *
 from typing import Optional
 from zipfile import ZipFile
-import sys
+from multiprocessing import Process
+from typing import Callable
+import asyncio
+
+class PluginFork:
+    result: asyncio.Task
+    worker: Process
+    exit: asyncio.Task
+    def terminate(self):
+        pass
 
 deviceManager: DeviceManager = None
 systemManager: SystemManager = None
 mediaManager: MediaManager = None
+clusterManager: ClusterManager = None
 zip: ZipFile = None
 remote: Any = None
+api: Any
+sdk: ScryptedStatic
 
-def sdk_init(z: ZipFile, r, sm: DeviceManager, dm: SystemManager, mm: MediaManager):
+def fork(options: Any) -> PluginFork:
+    pass
+
+class ScryptedStatic:
+    def __init__(self) -> None:
+        self.systemManager: SystemManager = None
+        self.deviceManager: DeviceManager = None
+        self.mediaManager: MediaManager = None
+        self.clusterManager: ClusterManager = None
+        self.zip: ZipFile = None
+        self.remote: Any = None
+        self.api: Any = None
+        self.fork: Callable[[], PluginFork]
+        self.connectRPCObject: Callable[[Any], asyncio.Task[Any]]
+
+def sdk_init(z: ZipFile, r, sm: SystemManager, dm: DeviceManager, mm: MediaManager):
     global zip
     global remote
     global systemManager
@@ -21,6 +48,34 @@ def sdk_init(z: ZipFile, r, sm: DeviceManager, dm: SystemManager, mm: MediaManag
     mediaManager = mm
     zip = z
     remote = r
+
+def sdk_init2(scryptedStatic: ScryptedStatic):
+    global zip
+    global remote
+    global systemManager
+    global deviceManager
+    global mediaManager
+    global clusterManager
+    global sdk
+    global api
+    global fork
+    sdk  = scryptedStatic
+    systemManager = sdk.systemManager
+    deviceManager = sdk.deviceManager
+    mediaManager = sdk.mediaManager
+    async def initDescriptors():
+        global api
+        try:
+            await api.setScryptedInterfaceDescriptors(TYPES_VERSION, ScryptedInterfaceDescriptors)
+        except:
+            pass
+    asyncio.ensure_future(initDescriptors())
+    if hasattr(sdk, 'clusterManager'):
+        clusterManager = sdk.clusterManager
+    zip = sdk.zip
+    remote = sdk.remote
+    api = sdk.api
+    fork = sdk.fork
 
 class ScryptedDeviceBase(DeviceState):
     nativeId: str | None

@@ -37,13 +37,16 @@ export async function createREPLServer(scrypted: ScryptedStatic, params: any, pl
         const ctx = Object.assign(params, {
             device,
             realDevice,
+            sdk: scrypted,
         });
         delete ctx.console;
         delete ctx.window;
         delete ctx.WebSocket;
         delete ctx.pluginHostAPI;
+        delete ctx.log;
+        delete ctx.pluginRuntimeAPI;
 
-        const replFilter = new Set<string>(['require', 'localStorage', 'exports', '__filename'])
+        const replFilter = new Set<string>(['require', 'localStorage', 'exports', '__filename', 'log'])
         const replVariables = Object.keys(ctx).filter(key => !replFilter.has(key));
 
         const welcome = `JavaScript REPL variables:\n${replVariables.map(key => '  ' + key).join('\n')}\n\n`;
@@ -72,5 +75,6 @@ export async function createREPLServer(scrypted: ScryptedStatic, params: any, pl
         socket.on('error', cleanup);
         socket.on('end', cleanup);
     });
-    return listenZero(server);
+    const address = process.env.SCRYPTED_CLUSTER_ADDRESS ? '0.0.0.0' : '127.0.0.1';
+    return listenZero(server, address);
 }

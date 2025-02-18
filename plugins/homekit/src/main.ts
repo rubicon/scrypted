@@ -1,22 +1,60 @@
-import { StorageSettings } from "@scrypted/sdk/storage-settings";
 import { SettingsMixinDeviceOptions } from '@scrypted/common/src/settings-mixin';
-import sdk, { DeviceProvider, MixinProvider, Online, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceProperty, Setting, Settings } from '@scrypted/sdk';
-import crypto from 'crypto';
+import sdk, { DeviceProvider, MixinProvider, Online, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceProperty, Setting, Settings, WritableDeviceState } from '@scrypted/sdk';
+import { StorageSettings } from "@scrypted/sdk/storage-settings";
+import fs from 'fs';
 import packageJson from "../package.json";
+import { getScryptedServerAddresses } from "./address-override";
 import { maybeAddBatteryService } from './battery';
 import { CameraMixin, canCameraMixin } from './camera-mixin';
 import { SnapshotThrottle, supportedTypes } from './common';
-import { Accessory, Bridge, Categories, Characteristic, ControllerStorage, MDNSAdvertiser, PublishInfo, Service } from './hap';
-import { createHAPUsernameStorageSettingsDict, getAddresses, getHAPUUID, getRandomPort as createRandomPort, initializeHapStorage, logConnections, typeToCategory } from './hap-utils';
-import { HomekitMixin, HOMEKIT_MIXIN } from './homekit-mixin';
+import { Accessory, Bridge, Categories, Characteristic, ControllerStorage, HAPStorage, MDNSAdvertiser, PublishInfo, Service } from './hap';
+import { createHAPUsernameStorageSettingsDict, getRandomPort as createRandomPort, getHAPUUID, logConnections, typeToCategory } from './hap-utils';
+import { HOMEKIT_MIXIN, HomekitMixin } from './homekit-mixin';
+import { addAccessoryDeviceInfo } from './info';
 import { randomPinCode } from './pincode';
 import './types';
 import { VIDEO_CLIPS_NATIVE_ID } from './types/camera/camera-recording-files';
+import { reorderDevicesByProvider } from './util';
 import { VideoClipsMixinProvider } from './video-clips-provider';
+import QRCode from 'qrcode-svg';
+
+const hapStorage: Storage = {
+    get length() {
+        return localStorage.length;
+    },
+    clear: function (): void {
+        return localStorage.clear();
+    },
+    key: function (index: number): string {
+        return localStorage.key(index);
+    },
+    removeItem: function (key: string): void {
+        return localStorage.removeItem(key);
+    },
+    getItem(key: string): any {
+        const data = localStorage.getItem(key);
+        if (!data)
+            return;
+        return JSON.parse(data);
+    },
+    setItem(key: string, value: any) {
+        localStorage.setItem(key, JSON.stringify(value));
+    },
+    setItemSync(key: string, value: any) {
+        localStorage.setItem(key, JSON.stringify(value));
+    },
+    removeItemSync(key: string) {
+        localStorage.removeItem(key);
+    },
+    persistSync() {
+    }
+}
+HAPStorage.storage = () => {
+    return hapStorage;
+}
 
 const { systemManager, deviceManager } = sdk;
 
-initializeHapStorage();
 const includeToken = 4;
 
 export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, Settings, DeviceProvider {
@@ -28,20 +66,7 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
     videoClipsId: string;
     cameraMixins = new Map<string, CameraMixin>();
     storageSettings = new StorageSettings(this, {
-        ...createHAPUsernameStorageSettingsDict(this, undefined, 'Network'),
-        addressOverride: {
-            group: 'Network',
-            title: 'Scrypted Server Address',
-            key: 'addressOverride',
-            description: 'Optional: The IP address used by the Scrypted server. Set this to the wired IP address to prevent usage of a wireless address.',
-            placeholder: '192.168.2.100',
-            combobox: true,
-            async onGet() {
-                return {
-                    choices: getAddresses(),
-                }
-            }
-        },
+        ...createHAPUsernameStorageSettingsDict(this, undefined),
         portOverride: {
             group: 'Network',
             title: 'Server Port',
@@ -53,8 +78,21 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             group: 'Network',
             title: 'mDNS Advertiser',
             description: 'Optional: Override the mDNS advertiser used to locate the Scrypted bridge',
-            choices: [MDNSAdvertiser.CIAO, MDNSAdvertiser.BONJOUR, MDNSAdvertiser.AVAHI],
-            defaultValue: MDNSAdvertiser.CIAO,
+            choices: ['Default', MDNSAdvertiser.CIAO, MDNSAdvertiser.BONJOUR, MDNSAdvertiser.AVAHI],
+            defaultValue: 'Default',
+        },
+        advertiserAddresses: {
+            group: 'Network',
+            title: 'mDNS Interfaces',
+            description: 'Optional: Change the address or interfaces that will advertise the HomeKit bridge and accessories.',
+            placeholder: '192.168.2.111, en0, etc.',
+            combobox: true,
+            choices: [
+                'Default',
+                'Server Address',
+                'All Addresses',
+            ],
+            defaultValue: 'Default',
         },
         slowConnections: {
             group: 'Network',
@@ -73,7 +111,14 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             hide: true,
             description: 'The last home hub to request a recording. Internally used to determine if a streaming request is coming from remote wifi.',
         },
+        autoAdd: {
+            title: "Auto enable",
+            description: "Automatically enable this mixin on new devices.",
+            type: 'boolean',
+            defaultValue: true,
+        },
     });
+    mergedDevices = new Set<string>();
 
     constructor() {
         super();
@@ -83,12 +128,11 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             await deviceManager.onDevicesChanged({
                 devices: [
                     {
-                        name: 'HomeKit Secure Video Local Copy',
+                        name: 'HomeKit Secure Video Debug Mode Clips',
                         nativeId: VIDEO_CLIPS_NATIVE_ID,
                         type: ScryptedDeviceType.DataSource,
                         interfaces: [
                             ScryptedInterface.VideoClips,
-                            ScryptedInterface.MixinProvider,
                             ScryptedInterface.Settings,
                             ScryptedInterface.Readme,
                         ],
@@ -100,6 +144,9 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
         })();
     }
 
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+    }
+
     async getDevice(nativeId: string) {
         if (nativeId === VIDEO_CLIPS_NATIVE_ID)
             return this.videoClips;
@@ -107,32 +154,39 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
     }
 
     async getSettings(): Promise<Setting[]> {
-        try {
-            this.storageSettings.settings.addressOverride.hide = false;
-            const service = await sdk.systemManager.getComponent('addresses');
-            if (service) {
-                if (this.storageSettings.values.addressOverride) {
-                    await service.setLocalAddresses([this.storageSettings.values.addressOverride]);
-                    this.storageSettings.values.addressOverride = undefined;
-                }
-                this.storageSettings.settings.addressOverride.hide = true;;
-            }
-        }
-        catch (e) {
-        }
         return this.storageSettings.getSettings();
     }
 
     async putSetting(key: string, value: string | number | boolean): Promise<void> {
         await this.storageSettings.putSetting(key, value);
 
-        if (key === this.storageSettings.keys.portOverride || key === this.storageSettings.keys.addressOverride) {
-            this.log.a('Reload the HomeKit plugin to apply this change.');
+        if (key === this.storageSettings.keys.portOverride) {
+            this.log.a(`The HomeKit plugin will reload momentarily for the changes to ${this.name} to take effect.`);
         }
+    }
+
+    getAdvertiser() {
+        let advertiser: MDNSAdvertiser = this.storageSettings.values.advertiserOverride;
+        switch (advertiser) {
+            case MDNSAdvertiser.BONJOUR:
+            case MDNSAdvertiser.AVAHI:
+            case MDNSAdvertiser.CIAO:
+                break;
+            default:
+                advertiser = MDNSAdvertiser.CIAO;
+                // this avahi detection doesn't work sometimes? fails silently.
+                // if (fs.existsSync('/var/run/avahi-daemon/'))
+                //     advertiser = MDNSAdvertiser.AVAHI;
+                // else
+                //     advertiser = MDNSAdvertiser.CIAO;
+                break;
+        }
+        return advertiser;
     }
 
     async start() {
         this.log.clearAlerts();
+        this.mergedDevices = new Set<string>();
 
         let defaultIncluded: any;
         try {
@@ -142,11 +196,28 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             defaultIncluded = {};
         }
 
-        const plugins = await systemManager.getComponent('plugins');
-
         const accessoryIds = new Set<string>();
+        const deviceIds = Object.keys(systemManager.getSystemState());
 
-        for (const id of Object.keys(systemManager.getSystemState())) {
+        // when creating accessories in order, some DeviceProviders may merge in
+        // their child devices (and report back which devices are merged via
+        // this.mergedDevices)
+        // we need to ensure that the iteration processes DeviceProviders before
+        // their children, so a reordering is necessary
+        const reorderedDeviceIds = reorderDevicesByProvider(deviceIds);
+
+        // safety checks in case something went wrong
+        if (deviceIds.length !== reorderedDeviceIds.length) {
+            throw Error(`error in device reordering, expected ${deviceIds.length} devices but only got ${reorderedDeviceIds.length}!`);
+        }
+        const uniqueDeviceIds = new Set<string>(deviceIds);
+        const uniqueReorderedIds = new Set<string>(reorderedDeviceIds);
+        if (uniqueDeviceIds.size !== uniqueReorderedIds.size) {
+            throw Error(`error in device reordering, expected ${uniqueDeviceIds.size} unique devices but only got ${uniqueReorderedIds.size} entries!`);
+        }
+
+        const autoAdd = this.storageSettings.values.autoAdd ?? true;
+        for (const id of reorderedDeviceIds) {
             const device = systemManager.getDeviceById<Online>(id);
             const supportedType = supportedTypes[device.type];
             if (!supportedType?.probe(device))
@@ -155,16 +226,30 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
             try {
                 const mixins = (device.mixins || []).slice();
                 if (!mixins.includes(this.id)) {
+                    // don't sync this by default, as it's solely for automations
+                    if (device.type === ScryptedDeviceType.Notifier)
+                        continue;
+                    // don't sync this because automations may randomly turn the siren on
+                    // since it is exposed as a switch. there's no native siren type.
+                    if (device.type === ScryptedDeviceType.Siren)
+                        continue;
                     if (defaultIncluded[device.id] === includeToken)
                         continue;
+                    if (!autoAdd)
+                        continue;
                     mixins.push(this.id);
-                    await plugins.setMixins(device.id, mixins);
+                    await device.setMixins(mixins);
                     defaultIncluded[device.id] = includeToken;
                 }
             }
             catch (e) {
                 console.error('error while checking device if syncable', e);
                 this.log.a('Error while checking device if syncable. See Console.');
+                continue;
+            }
+
+            if (this.mergedDevices.has(device.id)) {
+                this.console.log(`${device.name} was merged into an existing Homekit accessory and will not be exposed independently`)
                 continue;
             }
 
@@ -175,21 +260,7 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
                 accessoryIds.add(id);
 
                 maybeAddBatteryService(device, accessory);
-
-                const deviceInfo = device.info;
-                if (deviceInfo) {
-                    const info = accessory.getService(Service.AccessoryInformation)!;
-                    if (deviceInfo.manufacturer)
-                        info.updateCharacteristic(Characteristic.Manufacturer, deviceInfo.manufacturer);
-                    if (deviceInfo.model)
-                        info.updateCharacteristic(Characteristic.Model, deviceInfo.model);
-                    if (deviceInfo.serialNumber)
-                        info.updateCharacteristic(Characteristic.SerialNumber, deviceInfo.serialNumber);
-                    if (deviceInfo.firmware)
-                        info.updateCharacteristic(Characteristic.FirmwareRevision, deviceInfo.firmware);
-                    if (deviceInfo.version)
-                        info.updateCharacteristic(Characteristic.HardwareRevision, deviceInfo.version);
-                }
+                addAccessoryDeviceInfo(device, accessory);
 
                 const mixinStorage = deviceManager.getMixinStorage(device.id, this.nativeId);
                 const standalone = device.type === ScryptedDeviceType.Camera || device.type === ScryptedDeviceType.Doorbell ? mixinStorage.getItem('standalone') !== 'false' : mixinStorage.getItem('standalone') === 'true';
@@ -209,8 +280,9 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
                             return device.name
                         }
                     },
-                        'HomeKit', 'HomeKit Pairing'));
+                        undefined, 'Pairing'));
                     storageSettings.settings.pincode.persistedDefaultValue = randomPinCode();
+                    storageSettings.settings.addIdentifyingMaterial.persistedDefaultValue = true;
 
                     const mixinConsole = deviceManager.getMixinConsole(device.id, this.nativeId);
 
@@ -221,10 +293,10 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
                             published = true;
                             mixinConsole.log('Device is in accessory mode and is online. HomeKit services are being published.');
 
-                            await this.publishAccessory(accessory, storageSettings.values.mac, storageSettings.values.pincode, standaloneCategory, storageSettings.values.portOverride);
+                            await this.publishAccessory(accessory, storageSettings.values.mac, storageSettings.values.pincode, standaloneCategory, storageSettings.values.portOverride, storageSettings.values.addIdentifyingMaterial);
                             if (!hasPublished) {
                                 hasPublished = true;
-                                storageSettings.values.qrCode = accessory.setupURI();
+                                storageSettings.values.qrCode = new QRCode(accessory.setupURI()).svg();
                                 logConnections(mixinConsole, accessory, this.seenConnections);
                             }
                         }
@@ -291,25 +363,26 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
         info.updateCharacteristic(Characteristic.SerialNumber, username);
         info.updateCharacteristic(Characteristic.FirmwareRevision, packageJson.version);
 
+        const bind = await this.getAdvertiserInterfaceBind();
+        this.console.log('mdns bind address', bind);
+
         const publishInfo: PublishInfo = {
             username,
             port: this.storageSettings.values.portOverride,
             pincode: this.storageSettings.values.pincode,
             category: Categories.BRIDGE,
             addIdentifyingMaterial: true,
-            advertiser: this.storageSettings.values.advertiserOverride,
-            // bind: this.storageSettings.values.addressOverride || undefined,
+            advertiser: this.getAdvertiser(),
+            bind,
         };
 
-        this.bridge.publish(publishInfo, true);
-        this.storageSettings.values.qrCode = this.bridge.setupURI();
-        logConnections(this.console, this.bridge, this.seenConnections);
+        this.bridge.publish(publishInfo, true).then(() => {
+            this.storageSettings.values.qrCode = new QRCode(this.bridge.setupURI()).svg();
+            logConnections(this.console, this.bridge, this.seenConnections);
+        });
 
         systemManager.listen(async (eventSource, eventDetails, eventData) => {
             if (eventDetails.eventInterface !== ScryptedInterface.ScryptedDevice)
-                return;
-
-            if (!eventDetails.changed)
                 return;
 
             if (eventDetails.property === ScryptedInterfaceProperty.id)
@@ -317,10 +390,11 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
 
             const canMixin = await this.canMixin(eventSource.type, eventSource.interfaces);
             const includes = eventSource?.mixins?.includes(this.id);
-            const has = accessoryIds.has(eventSource?.id);
+            const has = accessoryIds.has(eventSource?.id) || this.mergedDevices.has(eventSource?.id);
             if (has && !canMixin) {
                 this.console.log('restart event', eventSource?.id, eventDetails.property, eventData);
-                this.log.a(`${eventSource.name} can no longer be synced. Reload the HomeKit plugin to apply these changes.`);
+                this.log.a(`${eventSource.name} can no longer be synced. HomeKit plugin will reload momentarily.`);
+                deviceManager.requestRestart();
                 return;
             }
 
@@ -353,23 +427,34 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
         return ret;
     }
 
-    async publishAccessory(accessory: Accessory, username: string, pincode: string, category: Categories, port: number) {
+    async getAdvertiserInterfaceBind() {
+        let bind: string = this.storageSettings.values.advertiserAddresses;
+        if (bind === 'All Addresses')
+            bind = undefined;
+        else if (!bind || bind === 'Default' || bind === 'Server Address')
+            return getScryptedServerAddresses();
+        return bind;
+    }
+
+    async publishAccessory(accessory: Accessory, username: string, pincode: string, category: Categories, port: number, addIdentifyingMaterial: boolean) {
+        const bind = await this.getAdvertiserInterfaceBind();
+
         await accessory.publish({
             username,
             port,
             pincode,
             category,
-            addIdentifyingMaterial: false,
-            advertiser: this.storageSettings.values.advertiserOverride,
-            // bind: this.storageSettings.values.addressOverride || undefined,
+            addIdentifyingMaterial,
+            advertiser: this.getAdvertiser(),
+            bind,
         });
     }
 
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any }) {
+    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState) {
         const options: SettingsMixinDeviceOptions<any> = {
             mixinProviderNativeId: this.nativeId,
             mixinDeviceInterfaces,
-            group: "HomeKit Settings",
+            group: "HomeKit",
             groupKey: "homekit",
             mixinDevice, mixinDeviceState,
         };
@@ -398,4 +483,4 @@ export class HomeKitPlugin extends ScryptedDeviceBase implements MixinProvider, 
     }
 }
 
-export default new HomeKitPlugin();
+export default HomeKitPlugin;
