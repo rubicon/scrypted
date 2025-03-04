@@ -514,7 +514,7 @@ class Device(TypedDict):
     providerNativeId: str  # The native id of the hub or discovery DeviceProvider that manages this device.
     refresh: bool  # Directs Scrypted to purge any previously returned instances of the device and call getDevice on the DeviceProvider.
     room: str
-    type: ScryptedDeviceType
+    type: str
 
 class DeviceCreatorSettings(TypedDict):
 
@@ -523,9 +523,8 @@ class DeviceCreatorSettings(TypedDict):
 
 class DeviceInformation(TypedDict):
 
-    col1: str
-    col2: str
     deeplink: Any
+    description: str
     firmware: str
     ip: str
     mac: str
@@ -550,7 +549,7 @@ class DiscoveredDevice(TypedDict):
     name: str
     nativeId: str
     settings: list[Setting]
-    type: ScryptedDeviceType
+    type: str
 
 class EndpointAccessControlAllowOrigin(TypedDict):
 
@@ -875,6 +874,7 @@ class ScryptedRuntimeArguments(TypedDict):
 class ScryptedSystemDeviceInfo(TypedDict):
 
     deviceCreator: str  # The description of device that will be created by this DeviceCreator. For example: Example Corp Camera or ACME Light Switch.
+    deviceDiscovery: str
     settings: str  # The name of the device as seen in System Settings.
 
 class ScryptedUserAccessControl(TypedDict):
@@ -980,7 +980,7 @@ class TamperState(TypedDict):
     pass
 
 
-TYPES_VERSION = "0.3.116"
+TYPES_VERSION = "0.5.3"
 
 
 class AirPurifier:
@@ -1268,7 +1268,7 @@ class Microphone:
 class MixinProvider:
     """MixinProviders can add and intercept interfaces to other devices to add or augment their behavior."""
 
-    async def canMixin(self, type: ScryptedDeviceType, interfaces: list[str]) -> None | list[str]:
+    async def canMixin(self, type: str, interfaces: list[str]) -> None | list[str]:
         pass
 
     async def getMixin(self, mixinDevice: Any, mixinDeviceInterfaces: list[ScryptedInterface], mixinDeviceState: WritableDeviceState) -> Any:
@@ -1485,12 +1485,12 @@ class ScryptedDevice:
     nativeId: str
     pluginId: str
     providedInterfaces: list[str]
-    providedName: ScryptedDeviceType
+    providedName: str
     providedRoom: str
-    providedType: ScryptedDeviceType
+    providedType: str
     providerId: str
     room: str
-    type: ScryptedDeviceType
+    type: str
     def listen(self, event: str | EventListenerOptions, callback: EventListener) -> EventListenerRegister:
         pass
 
@@ -2148,11 +2148,11 @@ class DeviceState:
         self.setScryptedProperty("providedInterfaces", value)
 
     @property
-    def providedName(self) -> ScryptedDeviceType:
+    def providedName(self) -> str:
         return self.getScryptedProperty("providedName")
 
     @providedName.setter
-    def providedName(self, value: ScryptedDeviceType):
+    def providedName(self, value: str):
         self.setScryptedProperty("providedName", value)
 
     @property
@@ -2164,11 +2164,11 @@ class DeviceState:
         self.setScryptedProperty("providedRoom", value)
 
     @property
-    def providedType(self) -> ScryptedDeviceType:
+    def providedType(self) -> str:
         return self.getScryptedProperty("providedType")
 
     @providedType.setter
-    def providedType(self, value: ScryptedDeviceType):
+    def providedType(self, value: str):
         self.setScryptedProperty("providedType", value)
 
     @property
@@ -2188,11 +2188,11 @@ class DeviceState:
         self.setScryptedProperty("room", value)
 
     @property
-    def type(self) -> ScryptedDeviceType:
+    def type(self) -> str:
         return self.getScryptedProperty("type")
 
     @type.setter
-    def type(self, value: ScryptedDeviceType):
+    def type(self, value: str):
         self.setScryptedProperty("type", value)
 
     @property
